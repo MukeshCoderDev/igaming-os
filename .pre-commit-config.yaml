@@ -1,0 +1,60 @@
+# .pre-commit-config.yaml — Phase 4 update.
+# Per ADR-0028 / DEC-0033: gitleaks (secret scan) + pip-audit (dep scan).
+# Per ADR-0027 / DEC-0032: mypy strict list.
+# Per ADR-0025 / DEC-0030: traceability linter + ruff.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^(src|tests)/
+      - id: ruff-format
+        files: ^(src|tests)/
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.0
+    hooks:
+      - id: gitleaks
+        # Pre-commit: scan staged diff only. CI re-runs full repo.
+        args: ["protect", "--staged", "--redact"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks: []  # placeholder; ruff hooks above.
+
+  - repo: local
+    hooks:
+      - id: check-traceability
+        name: Traceability linter (rules 1–23)
+        entry: bash scripts/check_traceability.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: mypy-strict
+        name: mypy (strict modules per ADR-0027)
+        entry: mypy
+        language: system
+        files: ^src/noventra/(settings|api|apps/core|observability|middleware|errors)/
+        pass_filenames: false
+        args: ["--strict", "src/noventra"]
+
+      - id: pip-audit
+        name: pip-audit (dependency scan, CVSS ≥7.0 blocks)
+        entry: pip-audit
+        language: system
+        args: ["--strict", "--vulnerability-service", "osv", "--desc"]
+        pass_filenames: false
+        always_run: true
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict

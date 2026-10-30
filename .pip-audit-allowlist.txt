@@ -1,0 +1,7 @@
+# .pip-audit-allowlist.txt — Phase 4 allowlist.
+# Per ADR-0028 / DEC-0033: records false positives or accepted-risk CVEs.
+# Format: <package>==<version> <CVE> <owner> <due-date> <justification>
+# One entry per line. Lines starting with # are comments.
+# Review monthly; stale entries are an audit finding.
+#
+# Phase 4 baseline: empty (no allowlisted CVEs).

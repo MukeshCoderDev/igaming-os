@@ -1,0 +1,90 @@
+openapi: 3.0.3
+info:
+  title: Noventra Platform API
+  description: |
+    B2B OS provider platform — Phase 3 skeleton.
+
+    See `docs/BLUEPRINT.md` for the full architecture and
+    `docs/adr/INDEX.md` for the 24 ADRs governing the platform.
+
+    Phase 3 exposes only the health endpoint. API v1 routes land in
+    Phase 4+ per the bounded contexts in
+    `docs/requirements/domain-boundaries.md`.
+  version: 0.3.0
+  contact:
+    name: Architecture Lead
+    url: docs/BLUEPRINT.md
+paths:
+  /health/:
+    get:
+      operationId: health_retrieve
+      summary: Platform health check
+      description: |
+        Returns 200 with status, version, and per-check booleans if all
+        checks pass. Returns 503 if any check fails. No secrets are
+        exposed in the response body.
+
+        Checks:
+        - `db`: SELECT 1 against the default database.
+        - `redis`: PING against the Redis instance.
+        - `migrations_applied`: count of migration files on disk vs.
+          count recorded in `django_migrations`.
+
+        Rate-limited (Phase 4 wires the throttle class).
+      tags:
+        - health
+      responses:
+        '200':
+          description: All checks passed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: At least one check failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - version
+        - checks
+      properties:
+        status:
+          type: string
+          enum: [healthy, unhealthy]
+          description: Overall health status.
+          example: healthy
+        version:
+          type: string
+          description: Platform version (from `noventra.__version__`).
+          example: 0.3.0
+        checks:
+          type: object
+          required:
+            - db
+            - redis
+            - migrations_applied
+          properties:
+            db:
+              type: boolean
+              description: Database connection healthy.
+              example: true
+            redis:
+              type: boolean
+              description: Redis connection healthy.
+              example: true
+            migrations_applied:
+              type: boolean
+              description: All on-disk migrations are recorded in the DB.
+              example: true
+          additionalProperties: false
+      additionalProperties: false
+tags:
+  - name: health
+    description: Platform health and readiness.

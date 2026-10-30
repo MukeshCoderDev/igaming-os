@@ -1,0 +1,115 @@
+# docker-compose.verify.yml — Stage B Verification for Phases 11-14
+#
+# Per the Stage B Verification Suite spec.
+# Usage: make verify-stage-b
+# Or:    docker-compose -f docker-compose.verify.yml up -d
+
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: noventra-verify-postgres
+    environment:
+      POSTGRES_DB: noventra_verify
+      POSTGRES_USER: noventra
+      POSTGRES_PASSWORD: verify_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata_verify:/var/lib/postgresql/data
+      - ./deploy/docker/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U noventra -d noventra_verify"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: noventra-verify-pgbouncer
+    environment:
+      DB_USER: noventra
+      DB_PASSWORD: verify_password
+      DB_HOST: postgres
+      DB_NAME: noventra_verify
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 50
+    ports:
+      - "6433:5432"
+    depends_on:
+      postgres:
+        condition: healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U noventra"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    container_name: noventra-verify-redis
+    ports:
+      - "6380:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    container_name: noventra-verify-app
+    depends_on:
+      postgres:
+        condition: healthy
+      pgbouncer:
+        condition: healthy
+      redis:
+        condition: healthy
+    environment:
+      SECRET_KEY: verify-secret-key-not-for-production
+      DATABASE_URL: postgres://noventra:verify_password@pgbouncer:5432/noventra_verify
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_SETTINGS_MODULE: noventra.settings.test
+      DEBUG: "false"
+      ALLOWED_HOSTS: "*"
+    volumes:
+      - .:/app
+    ports:
+      - "8001:8000"
+    command: >
+      bash -c "
+        python manage.py migrate --run-syncdb &&
+        python manage.py bootstrap_verify_data &&
+        tail -f /dev/null
+      "
+
+  load-tester:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    container_name: noventra-verify-loadtester
+    depends_on:
+      app:
+        condition: started
+    environment:
+      TARGET_URL: http://app:8000
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: verify-secret-key-not-for-production
+      DATABASE_URL: postgres://noventra:verify_password@pgbouncer:5432/noventra_verify
+      DJANGO_SETTINGS_MODULE: noventra.settings.test
+    volumes:
+      - .:/app
+      - ./verify-results:/results
+    command: tail -f /dev/null
+
+volumes:
+  pgdata_verify:

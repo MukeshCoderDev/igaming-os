@@ -1,0 +1,6 @@
+// .gitleaks-baseline.json — Phase 4 baseline.
+// Per ADR-0028 / DEC-0033: scan-forward, no history rewrite.
+// Records known findings that have been reviewed and accepted.
+// Format: array of gitleaks finding objects.
+// Empty array = no known findings (clean baseline).
+[]

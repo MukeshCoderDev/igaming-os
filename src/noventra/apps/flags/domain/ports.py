@@ -1,0 +1,1 @@
+"""flags domain ports (interfaces)."""

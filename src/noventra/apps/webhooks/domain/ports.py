@@ -1,0 +1,1 @@
+"""webhooks domain ports (interfaces)."""

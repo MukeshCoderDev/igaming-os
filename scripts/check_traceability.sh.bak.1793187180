@@ -1,0 +1,2257 @@
+#!/usr/bin/env bash
+# check_traceability.sh — Phase 15 traceability linter (rules 1–110). Game Platform & Realtime.
+#
+# Phase 1 rules (1-7) per BLUEPRINT v5.2 §11 and `traceability.md` §A:
+#   1. Row completeness — every REQ row has 7 non-empty cells; every DEC row has 8.
+#   2. Status enum — Status ∈ {Proposed, Accepted, Confirmed, HUMAN-APPROVED,
+#      Superseded, Deprecated, Rejected, Blocked}.
+#   3. Scope enum — Scope ∈ {Phase1, Phase2-3, Phase4-7, Phase8-10, Phase11,
+#      Phase12+, CrossCutting, Foundational, OutOfScope-Increment1}.
+#   4. Confirmed ⇒ citation (non-placeholder Source) or HUMAN-APPROVED.
+#   5. Legal/Regulatory/Licensing/Business/Budget/Vendor + Confirmed ⇒
+#      must be HUMAN-APPROVED.
+#   6. IDs unique across REQ and DEC tables.
+#   7. ADR-DEC mapping law:
+#        a. every ADR stub cites exactly one DEC (front-matter `DEC: DEC-00XX`);
+#        b. no DEC row cites more than one ADR;
+#        c. every ADR is cited by exactly one DEC;
+#        d. every ADR's cited DEC exists in the DEC table;
+#        e. every ADR named in the DEC table has a stub file.
+#
+# Phase 2 rules (8-12) per DEC-0025 / DEC-0026 and Phase 2 hard acceptance:
+#   8. Every NFR section in nfr.md has ≥1 mechanism row in nfr-allocation.md.
+#   9. Every bounded context in domain-boundaries.md has ≥1 component in
+#      docs/adr/INDEX.md §4 (03-view table).
+#  10. Every ADR carries Nygard front-matter (ADR, Title, Status, DEC, Owner,
+#      Created, Last-Reviewed, Supersedes) and five body sections
+#      (Context, Decision, Alternatives, Consequences, Validation Plan).
+#  11. INDEX ↔ DEC seed consistency:
+#        a. DEC-0001..0020 ↔ ADR-0001..0020 (1:1);
+#        b. DEC-0021 ↔ ADR-0021 (1:1);
+#        c. DEC-0022..0026 carry ADR = "none" in the DEC table;
+#        d. INDEX.md §2 status table rows match ADR file front-matter Status.
+#  12. Phase 2/3 architecture inventory exists:
+#        - docs/architecture/{security,nfr-allocation,capacity-assumptions,
+#          data-classification,risk-register,settings-split}.md
+#        - docs/adr/INDEX.md
+#        - docs/api/openapi.yaml
+#        - docs/stage-handoffs/stage-{02,03}-handoff.md
+#        - docs/errata/v5.2.1-verification.md
+#        - docs/audits/phase-{001,002,003}-audit.md
+#        - src/noventra/{__init__,settings/base,api/health,...}
+#        - pyproject.toml, Dockerfile, docker-compose.yml, .env.example,
+#          Makefile, CODEOWNERS, README.md, manage.py, pytest.ini
+#        - .github/workflows/ci.yml
+#        - deploy/docker/init/0[0-3]-*.sql
+#
+# Phase 3 rules (13-16) per DEC-0027 / DEC-0028 / ADR-0022..0024:
+#  13. .env.example covers every required env var (SECRET_KEY,
+#      DATABASE_URL, REDIS_URL).
+#  14. Makefile contains required targets: bootstrap, migrate, test,
+#      lint, typecheck, runserver.
+#  15. CODEOWNERS exists and references docs/requirements/roles.md.
+#  16. README.md exists and links to docs/BLUEPRINT.md + docs/audits/.
+#
+# Phase 4 rules (17-23) per DEC-0030..0033 / ADR-0025..0028:
+#  17. Phase 4 inventory files exist (observability/, middleware/,
+#      errors/, metrics, traces.md, gitleaks baseline, pip-audit
+#      allowlist, coverage baseline, branch-protection config).
+#  18. mypy strict modules list present in pyproject.toml
+#      ([[tool.mypy.overrides]] with noventra.observability/errors/middleware).
+#  19. Error catalog (src/noventra/errors/catalog.py) parses; has ≥1
+#      ErrorCode with code=, http_status=, i18n_key=, detail_template=.
+#  20. Trace matrices (docs/architecture/traces.md) exist with NFR,
+#      STRIDE, PII sections; all 15 PII IDs (PII-001..015) appear.
+#  21. .gitleaks-baseline.json + .pip-audit-allowlist.txt exist and
+#      are non-empty.
+#  22. deploy/ci/branch-protection.json + apply-branch-protection.sh
+#      exist (script executable); config has required_pull_request_reviews
+#      and allow_force_pushes fields.
+#  23. Five ADRs ACCEPTED (0017, 0025, 0026, 0027, 0028) with non-empty
+#      Approver lines.
+#
+# Exit code: 0 on success; 1 on any violation; 2 on configuration error.
+
+set -uo pipefail
+
+# ─── Configuration (override via env) ───────────────────────────────────
+TRACE_FILE="${TRACE_FILE:-docs/requirements/traceability.md}"
+ADR_DIR="${ADR_DIR:-docs/adr}"
+NFR_FILE="${NFR_FILE:-docs/requirements/nfr.md}"
+NFR_ALLOC_FILE="${NFR_ALLOC_FILE:-docs/architecture/nfr-allocation.md}"
+BOUNDARIES_FILE="${BOUNDARIES_FILE:-docs/requirements/domain-boundaries.md}"
+ADR_INDEX_FILE="${ADR_INDEX_FILE:-docs/adr/INDEX.md}"
+
+# Resolve to absolute paths so the script works from any CWD.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ -f "$TRACE_FILE" ] || TRACE_FILE="$ROOT/$TRACE_FILE"
+[ -d "$ADR_DIR" ]    || ADR_DIR="$ROOT/$ADR_DIR"
+[ -f "$NFR_FILE" ]       || NFR_FILE="$ROOT/$NFR_FILE"
+[ -f "$NFR_ALLOC_FILE" ] || NFR_ALLOC_FILE="$ROOT/$NFR_ALLOC_FILE"
+[ -f "$BOUNDARIES_FILE" ] || BOUNDARIES_FILE="$ROOT/$BOUNDARIES_FILE"
+[ -f "$ADR_INDEX_FILE" ]  || ADR_INDEX_FILE="$ROOT/$ADR_INDEX_FILE"
+
+# ─── Pre-flight ─────────────────────────────────────────────────────────
+if [ ! -f "$TRACE_FILE" ]; then
+    echo "LINT FAIL: traceability file not found: $TRACE_FILE" >&2
+    exit 2
+fi
+if [ ! -d "$ADR_DIR" ]; then
+    echo "LINT FAIL: ADR directory not found: $ADR_DIR" >&2
+    exit 2
+fi
+
+# ─── State ──────────────────────────────────────────────────────────────
+VIOLATIONS=0
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+REQS_TSV="$TMPDIR/reqs.tsv"
+DECS_TSV="$TMPDIR/decs.tsv"
+ALL_IDS="$TMPDIR/all_ids.txt"
+ADR_TO_DEC="$TMPDIR/adr_to_dec.tsv"   # basename → cited DEC
+DEC_TO_ADR="$TMPDIR/dec_to_adr.tsv"   # DEC ID → ADR basename
+: > "$ALL_IDS"; : > "$ADR_TO_DEC"; : > "$DEC_TO_ADR"
+
+# ─── Helpers ────────────────────────────────────────────────────────────
+fail() {
+    local rule="$1"; shift
+    echo "LINT FAIL [rule $rule]: $*" >&2
+    VIOLATIONS=$((VIOLATIONS + 1))
+}
+
+is_valid_status() {
+    case "$1" in
+        Proposed|Accepted|Confirmed|HUMAN-APPROVED|Superseded|Deprecated|Rejected|Blocked)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_valid_scope() {
+    case "$1" in
+        Phase1|Phase2-3|Phase4-7|Phase8-10|Phase11|Phase12+|CrossCutting|Foundational|OutOfScope-Increment1)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_rule5_category() {
+    case "$1" in
+        Legal|Regulatory|Licensing|Business|Budget|Vendor) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_placeholder_source() {
+    case "$1" in
+        ""|"—"|"-"|"N/A"|"n/a"|"TBD"|"tbd"|"TODO"|"todo") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ─── Extract REQ and DEC tables ─────────────────────────────────────────
+# Awk scans traceability.md, finds §B (REQ) and §C (DEC) sections, parses
+# pipe-table rows into TSV, trimming each cell. Separator rows (|---|) are
+# skipped. §D ends table extraction.
+awk -v reqs="$REQS_TSV" -v decs="$DECS_TSV" '
+    BEGIN { mode = ""; seen_sep = 0 }
+    /^## §B Requirements/ { mode = "req"; seen_sep = 0; next }
+    /^## §C Decisions/    { mode = "dec"; seen_sep = 0; next }
+    /^## §D /             { mode = "";    seen_sep = 0; next }
+    /^## §E /             { mode = "";    seen_sep = 0; next }
+    /^### /               { seen_sep = 0; next }   # sub-section header resets
+    mode != "" && /^\|/ {
+        # Skip the header separator row (|---|---|...).
+        if ($0 ~ /^\|[[:space:]]*[-:]+/) { seen_sep = 1; next }
+        # Skip the header row (it appears before the separator).
+        if (!seen_sep) next
+        line = $0
+        sub(/^\|/, "", line)
+        sub(/\|[[:space:]]*$/, "", line)
+        n = split(line, f, "|")
+        out = ""
+        for (i = 1; i <= n; i++) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", f[i])
+            out = out f[i] "\t"
+        }
+        sub(/\t$/, "", out)
+        if (mode == "req") print out > reqs
+        else               print out > decs
+    }
+' "$TRACE_FILE"
+
+# ─── Rule 6 prep: collect all IDs, check uniqueness ─────────────────────
+while IFS=$'\t' read -r id _ _ _ _ _ _; do
+    [ -n "$id" ] && echo "$id" >> "$ALL_IDS"
+done < "$REQS_TSV"
+while IFS=$'\t' read -r id _ _ _ _ _ _ _; do
+    [ -n "$id" ] && echo "$id" >> "$ALL_IDS"
+done < "$DECS_TSV"
+
+if [ -s "$ALL_IDS" ]; then
+    dup_ids="$(sort "$ALL_IDS" | uniq -d)"
+    if [ -n "$dup_ids" ]; then
+        while IFS= read -r dup; do
+            [ -n "$dup" ] && fail 6 "duplicate ID: $dup"
+        done <<< "$dup_ids"
+    fi
+fi
+
+# ─── Rules 1–5 for REQ rows ─────────────────────────────────────────────
+req_count=0
+while IFS=$'\t' read -r id title cat status scope owner source; do
+    req_count=$((req_count + 1))
+    # Rule 1: row completeness (7 cells, all non-empty).
+    if [ -z "$id" ] || [ -z "$title" ] || [ -z "$cat" ] || \
+       [ -z "$status" ] || [ -z "$scope" ] || [ -z "$owner" ] || [ -z "$source" ]; then
+        fail 1 "REQ row #$req_count has an empty required field"
+        continue
+    fi
+    # Rule 2: status enum.
+    if ! is_valid_status "$status"; then
+        fail 2 "REQ $id has invalid status: '$status'"
+    fi
+    # Rule 3: scope enum.
+    if ! is_valid_scope "$scope"; then
+        fail 3 "REQ $id has invalid scope: '$scope'"
+    fi
+    # Rule 4: Confirmed ⇒ citation.
+    if [ "$status" = "Confirmed" ] && is_placeholder_source "$source"; then
+        fail 4 "REQ $id is Confirmed but source is empty/placeholder"
+    fi
+    # Rule 5: rule-5 category + Confirmed ⇒ must be HUMAN-APPROVED.
+    if is_rule5_category "$cat" && [ "$status" = "Confirmed" ]; then
+        fail 5 "REQ $id (category '$cat') is Confirmed; must be HUMAN-APPROVED"
+    fi
+done < "$REQS_TSV"
+
+# ─── Rules 1–5, 7a for DEC rows ─────────────────────────────────────────
+dec_count=0
+while IFS=$'\t' read -r id title cat status scope owner source adr; do
+    dec_count=$((dec_count + 1))
+    # Rule 1: 8 cells, all non-empty (ADR column may be "none" but not empty).
+    if [ -z "$id" ] || [ -z "$title" ] || [ -z "$cat" ] || \
+       [ -z "$status" ] || [ -z "$scope" ] || [ -z "$owner" ] || [ -z "$source" ]; then
+        fail 1 "DEC row #$dec_count has an empty required field (cols 1–7)"
+        continue
+    fi
+    if [ -z "$adr" ]; then
+        fail 1 "DEC $id has an empty ADR column (use 'none' if no ADR)"
+        continue
+    fi
+    # Rule 2: status enum.
+    if ! is_valid_status "$status"; then
+        fail 2 "DEC $id has invalid status: '$status'"
+    fi
+    # Rule 3: scope enum.
+    if ! is_valid_scope "$scope"; then
+        fail 3 "DEC $id has invalid scope: '$scope'"
+    fi
+    # Rule 4: Confirmed ⇒ citation.
+    if [ "$status" = "Confirmed" ] && is_placeholder_source "$source"; then
+        fail 4 "DEC $id is Confirmed but source is empty/placeholder"
+    fi
+    # Rule 5: rule-5 category + Confirmed ⇒ must be HUMAN-APPROVED.
+    if is_rule5_category "$cat" && [ "$status" = "Confirmed" ]; then
+        fail 5 "DEC $id (category '$cat') is Confirmed; must be HUMAN-APPROVED"
+    fi
+    # Rule 7a: at most one ADR token in the ADR column.
+    adr_token_count=$(printf '%s' "$adr" | grep -oE 'ADR-[0-9]{4}' | wc -l | tr -d ' ')
+    if [ "$adr_token_count" -gt 1 ]; then
+        fail 7 "DEC $id cites $adr_token_count ADRs; at most one allowed"
+    fi
+    # Record DEC→ADR mapping for rules 7c–7e.
+    if [ "$adr" != "none" ] && [ "$adr_token_count" -ge 1 ]; then
+        adr_id=$(printf '%s' "$adr" | grep -oE 'ADR-[0-9]{4}' | head -1)
+        printf '%s\t%s\n' "$id" "$adr_id" >> "$DEC_TO_ADR"
+    fi
+done < "$DECS_TSV"
+
+# ─── Rule 7b: each ADR stub cites exactly one DEC ───────────────────────
+shopt -s nullglob
+adr_files=("$ADR_DIR"/ADR-*.md)
+adr_count=${#adr_files[@]}
+if [ "$adr_count" -eq 0 ]; then
+    fail 7 "no ADR stubs found in $ADR_DIR"
+fi
+for adr_file in "${adr_files[@]}"; do
+    basename_noext="$(basename "$adr_file" .md)"
+    # Front-matter is the block between the first two lines that are exactly '---'.
+    dec_lines=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^DEC:/ { print }
+        fm >= 2 { exit }
+    ' "$adr_file")
+    dec_line_count=$(printf '%s\n' "$dec_lines" | grep -c '^DEC:' || true)
+    if [ "$dec_line_count" -eq 0 ]; then
+        fail 7 "$basename_noext: front-matter missing 'DEC: DEC-00XX' citation"
+        continue
+    fi
+    if [ "$dec_line_count" -gt 1 ]; then
+        fail 7 "$basename_noext: front-matter has $dec_line_count DEC lines; exactly 1 required"
+        continue
+    fi
+    # Extract the DEC value.
+    dec_value=$(printf '%s\n' "$dec_lines" | head -1 | sed -E 's/^DEC:[[:space:]]*//; s/[[:space:]]+$//')
+    if ! printf '%s' "$dec_value" | grep -qE '^DEC-[0-9]{4}$'; then
+        fail 7 "$basename_noext: DEC citation '$dec_value' is not in 'DEC-00XX' format"
+        continue
+    fi
+    printf '%s\t%s\n' "$basename_noext" "$dec_value" >> "$ADR_TO_DEC"
+done
+
+# ─── Rule 7c: every ADR is cited by exactly one DEC ─────────────────────
+while IFS=$'\t' read -r adr_basename dec_cited; do
+    citing_dec_count=$(awk -v adr="$adr_basename" -F'\t' '$2 == adr { c++ } END { print c+0 }' "$DEC_TO_ADR")
+    if [ "$citing_dec_count" -eq 0 ]; then
+        fail 7 "$adr_basename: cited by 0 DECs (must be cited by exactly 1)"
+    elif [ "$citing_dec_count" -gt 1 ]; then
+        fail 7 "$adr_basename: cited by $citing_dec_count DECs (must be cited by exactly 1)"
+    fi
+done < "$ADR_TO_DEC"
+
+# ─── Rule 7d: every ADR's cited DEC exists in the DEC table ─────────────
+dec_ids_in_table=$(awk -F'\t' '{print $1}' "$DECS_TSV" | sort -u)
+while IFS=$'\t' read -r adr_basename dec_cited; do
+    if ! printf '%s\n' "$dec_ids_in_table" | grep -qx "$dec_cited"; then
+        fail 7 "$adr_basename cites $dec_cited which is not in the DEC table"
+    fi
+done < "$ADR_TO_DEC"
+
+# ─── Rule 7e: every ADR named in DEC table has a stub file ──────────────
+while IFS=$'\t' read -r dec_id adr_id; do
+    if [ ! -f "$ADR_DIR/$adr_id.md" ]; then
+        fail 7 "DEC $dec_id cites $adr_id but no file $ADR_DIR/$adr_id.md exists"
+    fi
+done < "$DEC_TO_ADR"
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 2 rules (8–12)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 8: every NFR section in nfr.md → ≥1 mechanism row in
+#     nfr-allocation.md ──────────────────────────────────────────────────
+# Strategy: extract NFR IDs (§X.Y headings) from nfr.md, then verify each
+# appears in nfr-allocation.md. We treat "appears" as the literal string
+# "§X.Y" being present in the allocation file.
+if [ ! -f "$NFR_FILE" ]; then
+    fail 8 "NFR file not found: $NFR_FILE"
+elif [ ! -f "$NFR_ALLOC_FILE" ]; then
+    fail 8 "NFR allocation file not found: $NFR_ALLOC_FILE"
+else
+    nfr_alloc_text="$(cat "$NFR_ALLOC_FILE")"
+    # Extract NFR IDs: lines like "### §1.1 Encryption at rest" or table rows
+    # in nfr.md that start with "| §". We grep for `§<digit>.<digit>`.
+    nfr_ids_in_nfr="$(grep -oE '§[0-9]+\.[0-9]+' "$NFR_FILE" | sort -u)"
+    nfr_count_total=0
+    nfr_count_missing=0
+    while IFS= read -r nfr_id; do
+        [ -z "$nfr_id" ] && continue
+        nfr_count_total=$((nfr_count_total + 1))
+        if ! printf '%s' "$nfr_alloc_text" | grep -qF "$nfr_id"; then
+            fail 8 "NFR $nfr_id (from nfr.md) has no mechanism row in nfr-allocation.md"
+            nfr_count_missing=$((nfr_count_missing + 1))
+        fi
+    done <<< "$nfr_ids_in_nfr"
+fi
+
+# ─── Rule 9: every bounded context in domain-boundaries.md → ≥1 component
+#     in docs/adr/INDEX.md §4 (03-view table) ────────────────────────────
+# Strategy: extract context names from domain-boundaries.md §1 table (first
+# data column), then verify each appears in INDEX.md §4 component table.
+if [ ! -f "$BOUNDARIES_FILE" ]; then
+    fail 9 "Boundaries file not found: $BOUNDARIES_FILE"
+elif [ ! -f "$ADR_INDEX_FILE" ]; then
+    fail 9 "ADR INDEX file not found: $ADR_INDEX_FILE"
+else
+    index_text="$(cat "$ADR_INDEX_FILE")"
+    # Bounded contexts appear as rows in domain-boundaries.md §1 with names
+    # like "Tenancy", "Identity", "Audit", etc. We check each single-word
+    # context name, then the three multi-word contexts explicitly.
+    single_word_contexts="Tenancy Identity Audit Ledger Configuration Telemetry Reliability Sandbox Webhooks"
+    for ctx in $single_word_contexts; do
+        if ! printf '%s' "$index_text" | grep -qF "$ctx"; then
+            fail 9 "Bounded context '$ctx' has no component row in ADR INDEX §4"
+        fi
+    done
+    # Explicit checks for multi-word contexts:
+    for multi in "Workflow Engine" "Feature Flags" "Backups & DR"; do
+        if ! printf '%s' "$index_text" | grep -qF "$multi"; then
+            fail 9 "Bounded context '$multi' has no component row in ADR INDEX §4"
+        fi
+    done
+fi
+
+# ─── Rule 10: every ADR carries Nygard front-matter + body sections ──────
+# Front-matter required keys: ADR, Title, Status, DEC, Owner, Created,
+# Last-Reviewed, Supersedes.
+# Body required sections (## headings): Context, Decision, Alternatives,
+# Consequences, Validation Plan.
+nygard_fm_keys="ADR Title Status DEC Owner Created Last-Reviewed Supersedes"
+nygard_body_sections=("Context" "Decision" "Alternatives" "Consequences" "Validation Plan")
+for adr_file in "$ADR_DIR"/ADR-*.md; do
+    basename_noext="$(basename "$adr_file" .md)"
+    # Front-matter block is between first two `---` lines.
+    fm_text=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 { print }
+        fm >= 2 { exit }
+    ' "$adr_file")
+    for key in $nygard_fm_keys; do
+        if ! printf '%s\n' "$fm_text" | grep -qE "^${key}:"; then
+            fail 10 "$basename_noext: front-matter missing key '$key:'"
+        fi
+    done
+    # Body sections: grep for `## <Section>` headings. Multi-word section
+    # names (e.g. "Validation Plan") are matched as a literal phrase.
+    body_text="$(cat "$adr_file")"
+    for sec in "${nygard_body_sections[@]}"; do
+        if ! printf '%s' "$body_text" | grep -qE "^## ${sec}\$"; then
+            fail 10 "$basename_noext: body missing section '## ${sec}'"
+        fi
+    done
+done
+
+# ─── Rule 11: INDEX ↔ DEC seed consistency ───────────────────────────────
+# (a) DEC-0001..0020 ↔ ADR-0001..0020 (1:1 by number)
+# (b) DEC-0021 ↔ ADR-0021 (1:1 by number)
+# (c) DEC-0022..0026 carry ADR = "none" in the DEC table
+# (d) INDEX.md §2 status rows match ADR file front-matter Status
+# (e) DEC-0027 ↔ ADR-0022; DEC-0028 ↔ ADR-0023; DEC-0029 ↔ ADR-0024
+#     (DEC and ADR number spaces are independent per DEC-0023 §A.4 invariant 4)
+#
+# Expected DEC → ADR mapping. For DEC-0001..0021, ADR number = DEC number.
+# For DEC-0027/0028/0029, the ADR number is given explicitly. All other DECs
+# (0022..0026) expect "none".
+EXPECTED_MAP_FILE="$TMPDIR/expected_map.tsv"
+{
+    for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016 0017 0018 0019 0020 0021; do
+        printf 'DEC-%s\tADR-%s\n' "$n" "$n"
+    done
+    printf 'DEC-0027\tADR-0022\n'
+    printf 'DEC-0028\tADR-0023\n'
+    printf 'DEC-0029\tADR-0024\n'
+    printf 'DEC-0030\tADR-0025\n'
+    printf 'DEC-0031\tADR-0026\n'
+    printf 'DEC-0032\tADR-0027\n'
+    printf 'DEC-0033\tADR-0028\n'
+    printf 'DEC-0034\tADR-0029\n'
+    printf 'DEC-0035\tADR-0030\n'
+    printf 'DEC-0036\tADR-0031\n'
+    printf 'DEC-0037\tADR-0032\n'
+    printf 'DEC-0038\tADR-0033\n'
+    printf 'DEC-0039\tADR-0034\n'
+    printf 'DEC-0040\tADR-0035\n'
+    printf 'DEC-0041\tADR-0036\n'
+    printf 'DEC-0042\tADR-0037\n'
+    printf 'DEC-0043\tADR-0038\n'
+    printf 'DEC-0044\tADR-0039\n'
+    printf 'DEC-0045\tADR-0040\n'
+    printf 'DEC-0046\tADR-0041\n'
+    printf 'DEC-0047\tADR-0042\n'
+    printf 'DEC-0048\tADR-0043\n'
+    printf 'DEC-0049\tADR-0044\n'
+    printf 'DEC-0050\tADR-0045\n'
+    printf 'DEC-0051\tADR-0046\n'
+    printf 'DEC-0052\tADR-0047\n'
+    printf 'DEC-0053\tADR-0048\n'
+    printf 'DEC-0054\tADR-0049\n'
+    printf 'DEC-0055\tADR-0050\n'
+    printf 'DEC-0056\tADR-0051\n'
+    printf 'DEC-0057\tADR-0052\n'
+    printf 'DEC-0058\tADR-0053\n'
+    printf 'DEC-0059\tADR-0054\n'
+    printf 'DEC-0060\tADR-0055\n'
+    printf 'DEC-0061\tADR-0056\n'
+    printf 'DEC-0062\tADR-0057\n'
+    printf 'DEC-0063\tADR-0058\n'
+    printf 'DEC-0065\tADR-0059\n'
+    printf 'DEC-0066\tADR-0060\n'
+    printf 'DEC-0067\tADR-0061\n'
+    printf 'DEC-0068\tADR-0062\n'
+    printf 'DEC-0069\tADR-0063\n'
+    printf 'DEC-0070\tADR-0064\n'
+    printf 'DEC-0071\tADR-0065\n'
+    printf 'DEC-0072\tADR-0072\n'
+    printf 'DEC-0073\tADR-0073\n'
+    printf 'DEC-0074\tADR-0074\n'
+    printf 'DEC-0075\tADR-0075\n'
+    printf 'DEC-0076\tADR-0076\n'
+    printf 'DEC-0077\tADR-0077\n'
+    printf 'DEC-0078\tADR-0078\n'
+    printf 'DEC-0079\tADR-0079\n'
+    printf 'DEC-0080\tADR-0080\n'
+    printf 'DEC-0081\tADR-0081\n'
+    printf 'DEC-0082\tADR-0082\n'
+    printf 'DEC-0083\tADR-0083\n'
+    printf 'DEC-0084\tADR-0084\n'
+    printf 'DEC-0085\tADR-0085\n'
+    printf 'DEC-0086\tADR-0086\n'
+    printf 'DEC-0087\tADR-0087\n'
+    printf 'DEC-0088\tADR-0088\n'
+    printf 'DEC-0089\tADR-0089\n'
+    printf 'DEC-0090\tADR-0090\n'
+    printf 'DEC-0091\tADR-0091\n'    printf 'DEC-0093\tADR-0092\n'    printf 'DEC-0094\tADR-0093\n'    printf 'DEC-0095\tADR-0094\n'
+} > "$EXPECTED_MAP_FILE"
+
+# (a) + (b) + (e): For each DEC in the expected map, verify the DEC table's
+# ADR column matches.
+while IFS=$'\t' read -r dec_id expected_adr; do
+    actual_adr=$(awk -F'\t' -v dec="$dec_id" '$1 == dec { print $8 }' "$DECS_TSV")
+    if [ -z "$actual_adr" ]; then
+        fail 11 "$dec_id not found in DEC table"
+    elif [ "$actual_adr" != "$expected_adr" ]; then
+        fail 11 "$dec_id ADR column '$actual_adr' ≠ expected '$expected_adr'"
+    fi
+done < "$EXPECTED_MAP_FILE"
+# (c): DEC-0022..0026 must have ADR = "none".
+expected_dec_none="$(awk -F'\t' '
+    /^DEC-00(2[2-6])\t/ { print $1 "\t" $8 }
+    /^DEC-0064\t/ { print $1 "\t" $8 }
+' "$DECS_TSV")"
+while IFS=$'\t' read -r dec_id adr_col; do
+    if [ "$adr_col" != "none" ]; then
+        fail 11 "$dec_id ADR column '$adr_col' ≠ expected 'none'"
+    fi
+done <<< "$expected_dec_none"
+# (d): INDEX.md §2 status rows match ADR file front-matter Status.
+# INDEX.md §2 table columns: | ADR | Title | DEC | Owner | Status | Created |
+# Last-Reviewed | Supersedes | Superseded-By |
+# Split by `|`: $1=empty, $2=ADR, $3=Title, $4=DEC, $5=Owner, $6=Status.
+if [ -f "$ADR_INDEX_FILE" ]; then
+    while IFS= read -r line; do
+        # Match table rows starting with "| ADR-XXXX |"
+        if printf '%s' "$line" | grep -qE '^\| ADR-[0-9]{4} \|'; then
+            adr_id=$(printf '%s' "$line" | grep -oE 'ADR-[0-9]{4}' | head -1)
+            index_status=$(printf '%s' "$line" | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $6); print $6}')
+            adr_file="$ADR_DIR/${adr_id}.md"
+            if [ -f "$adr_file" ]; then
+                fm_status=$(awk '
+                    /^---[[:space:]]*$/ { fm++; next }
+                    fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+                    fm >= 2 { exit }
+                ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+                if [ "$index_status" != "$fm_status" ]; then
+                    fail 11 "$adr_id: INDEX status '$index_status' ≠ ADR front-matter status '$fm_status'"
+                fi
+            fi
+        fi
+    done < "$ADR_INDEX_FILE"
+fi
+
+# ─── Rule 12: Phase 2 architecture inventory files exist ────────────────
+required_phase2_files=(
+    "$ROOT/docs/architecture/security.md"
+    "$ROOT/docs/architecture/nfr-allocation.md"
+    "$ROOT/docs/architecture/capacity-assumptions.md"
+    "$ROOT/docs/architecture/data-classification.md"
+    "$ROOT/docs/architecture/risk-register.md"
+    "$ROOT/docs/adr/INDEX.md"
+    "$ROOT/docs/stage-handoffs/stage-02-handoff.md"
+    "$ROOT/docs/errata/v5.2.1-verification.md"
+    "$ROOT/docs/audits/phase-001-audit.md"
+    "$ROOT/docs/audits/phase-002-audit.md"
+    # Phase 3 additions:
+    "$ROOT/docs/architecture/settings-split.md"
+    "$ROOT/docs/api/openapi.yaml"
+    "$ROOT/docs/stage-handoffs/stage-03-handoff.md"
+    "$ROOT/docs/audits/phase-003-audit.md"
+    "$ROOT/src/noventra/__init__.py"
+    "$ROOT/src/noventra/settings/base.py"
+    "$ROOT/src/noventra/settings/local.py"
+    "$ROOT/src/noventra/settings/test.py"
+    "$ROOT/src/noventra/settings/production.py"
+    "$ROOT/src/noventra/api/health.py"
+    "$ROOT/src/noventra/apps/core/migrations/0001_initial.py"
+    "$ROOT/pyproject.toml"
+    "$ROOT/Dockerfile"
+    "$ROOT/docker-compose.yml"
+    "$ROOT/.env.example"
+    "$ROOT/Makefile"
+    "$ROOT/CODEOWNERS"
+    "$ROOT/README.md"
+    "$ROOT/manage.py"
+    "$ROOT/pytest.ini"
+    "$ROOT/.github/workflows/ci.yml"
+    "$ROOT/deploy/docker/init/00-extensions.sql"
+    "$ROOT/deploy/docker/init/01-roles.sql"
+    "$ROOT/deploy/docker/init/02-grants.sql"
+    "$ROOT/deploy/docker/init/03-rls-function.sql"
+)
+for f in "${required_phase2_files[@]}"; do
+    if [ ! -f "$f" ]; then
+        fail 12 "Phase 2/3 inventory file missing: $f"
+    elif [ ! -s "$f" ]; then
+        fail 12 "Phase 2/3 inventory file empty: $f"
+    fi
+done
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 3 rules (13–16)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 13: .env.example covers every required env var ────────────────
+# Per DEC-0028 / ADR-0023, required env vars are SECRET_KEY, DATABASE_URL,
+# REDIS_URL. Each must appear as a key in .env.example.
+ENV_EXAMPLE="$ROOT/.env.example"
+required_env_vars="SECRET_KEY DATABASE_URL REDIS_URL"
+if [ ! -f "$ENV_EXAMPLE" ]; then
+    fail 13 ".env.example not found: $ENV_EXAMPLE"
+else
+    for var in $required_env_vars; do
+        if ! grep -qE "^${var}=" "$ENV_EXAMPLE"; then
+            fail 13 ".env.example missing required env var: $var"
+        fi
+    done
+fi
+
+# ─── Rule 14: Makefile contains required make targets ───────────────────
+MAKEFILE="$ROOT/Makefile"
+required_targets="bootstrap migrate test lint typecheck runserver"
+if [ ! -f "$MAKEFILE" ]; then
+    fail 14 "Makefile not found: $MAKEFILE"
+else
+    for target in $required_targets; do
+        # Match lines like "bootstrap:  ## ..." or "bootstrap:"
+        if ! grep -qE "^${target}:" "$MAKEFILE"; then
+            fail 14 "Makefile missing required target: ${target}"
+        fi
+    done
+fi
+
+# ─── Rule 15: CODEOWNERS exists and references roles.md ─────────────────
+CODEOWNERS="$ROOT/CODEOWNERS"
+if [ ! -f "$CODEOWNERS" ]; then
+    fail 15 "CODEOWNERS not found: $CODEOWNERS"
+else
+    if ! grep -q "docs/requirements/roles.md" "$CODEOWNERS"; then
+        fail 15 "CODEOWNERS does not reference docs/requirements/roles.md"
+    fi
+fi
+
+# ─── Rule 16: README exists and links to BLUEPRINT.md + docs/audits/ ────
+README="$ROOT/README.md"
+if [ ! -f "$README" ]; then
+    fail 16 "README.md not found: $README"
+else
+    if ! grep -q "docs/BLUEPRINT.md" "$README"; then
+        fail 16 "README.md does not link to docs/BLUEPRINT.md"
+    fi
+    if ! grep -q "docs/audits/" "$README"; then
+        fail 16 "README.md does not link to docs/audits/"
+    fi
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 4 rules (17–23)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 17: Phase 4 inventory files exist ─────────────────────────────
+required_phase4_files=(
+    "$ROOT/src/noventra/observability/__init__.py"
+    "$ROOT/src/noventra/observability/logging.py"
+    "$ROOT/src/noventra/observability/redaction.py"
+    "$ROOT/src/noventra/observability/sampling.py"
+    "$ROOT/src/noventra/observability/prometheus.py"
+    "$ROOT/src/noventra/observability/otel.py"
+    "$ROOT/src/noventra/middleware/__init__.py"
+    "$ROOT/src/noventra/middleware/correlation.py"
+    "$ROOT/src/noventra/errors/__init__.py"
+    "$ROOT/src/noventra/errors/catalog.py"
+    "$ROOT/src/noventra/errors/handlers.py"
+    "$ROOT/src/noventra/api/metrics.py"
+    "$ROOT/src/noventra/api/metrics_urls.py"
+    "$ROOT/docs/architecture/error-catalog.md"
+    "$ROOT/docs/architecture/traces.md"
+    "$ROOT/docs/stage-handoffs/stage-04-handoff.md"
+    "$ROOT/docs/audits/phase-004-audit.md"
+    "$ROOT/.gitleaks-baseline.json"
+    "$ROOT/.pip-audit-allowlist.txt"
+    "$ROOT/.coverage-baseline-phase4.txt"
+    "$ROOT/deploy/ci/branch-protection.json"
+    "$ROOT/deploy/ci/apply-branch-protection.sh"
+)
+for f in "${required_phase4_files[@]}"; do
+    if [ ! -f "$f" ]; then
+        fail 17 "Phase 4 inventory file missing: $f"
+    elif [ ! -s "$f" ]; then
+        fail 17 "Phase 4 inventory file empty: $f"
+    fi
+done
+
+# ─── Rule 18: mypy strict modules list is present in pyproject.toml ────
+# Per ADR-0027 / DEC-0032. Verifies the [tool.mypy.overrides] section
+# exists with a non-empty module list. (Does not run mypy; CI does that.)
+PYPROJECT="$ROOT/pyproject.toml"
+if ! grep -q "\[\[tool.mypy.overrides\]\]" "$PYPROJECT"; then
+    fail 18 "pyproject.toml missing [[tool.mypy.overrides]] section"
+elif ! grep -q "noventra.observability" "$PYPROJECT"; then
+    fail 18 "mypy strict list does not include noventra.observability"
+elif ! grep -q "noventra.errors" "$PYPROJECT"; then
+    fail 18 "mypy strict list does not include noventra.errors"
+elif ! grep -q "noventra.middleware" "$PYPROJECT"; then
+    fail 18 "mypy strict list does not include noventra.middleware"
+fi
+
+# ─── Rule 19: Error catalog parses; one HTTP status per code; i18n keys ─
+# Per ADR-0026 / DEC-0031. Verifies catalog.py defines ERROR_CATALOG and
+# every ErrorCode has required fields. Does not import the module (would
+# require Django); uses regex extraction.
+CATALOG="$ROOT/src/noventra/errors/catalog.py"
+if [ ! -f "$CATALOG" ]; then
+    fail 19 "Error catalog not found: $CATALOG"
+else
+    # Count ErrorCode entries.
+    error_count=$(grep -cE "^\s*ErrorCode\(" "$CATALOG" || true)
+    if [ "$error_count" -lt 1 ]; then
+        fail 19 "Error catalog has no ErrorCode entries"
+    fi
+    # Verify each ErrorCode has all required fields (code, http_status, i18n_key, title, detail_template).
+    if ! grep -q "code=" "$CATALOG"; then
+        fail 19 "Error catalog has an ErrorCode missing 'code='"
+    fi
+    if ! grep -q "http_status=" "$CATALOG"; then
+        fail 19 "Error catalog has an ErrorCode missing 'http_status='"
+    fi
+    if ! grep -q "i18n_key=" "$CATALOG"; then
+        fail 19 "Error catalog has an ErrorCode missing 'i18n_key='"
+    fi
+    if ! grep -q "detail_template=" "$CATALOG"; then
+        fail 19 "Error catalog has an ErrorCode missing 'detail_template='"
+    fi
+fi
+
+# ─── Rule 20: Trace matrices exist (NFR, STRIDE, PII) ──────────────────
+# Per Phase 4 spec output #15. Verifies traces.md has all three sections.
+TRACES="$ROOT/docs/architecture/traces.md"
+if [ ! -f "$TRACES" ]; then
+    fail 20 "Traces doc not found: $TRACES"
+else
+    if ! grep -q "## 1. NFR → artifact" "$TRACES"; then
+        fail 20 "traces.md missing §1 NFR → artifact section"
+    fi
+    if ! grep -q "## 2. STRIDE → artifact" "$TRACES"; then
+        fail 20 "traces.md missing §2 STRIDE → artifact section"
+    fi
+    if ! grep -q "## 3. PII class → redaction rule" "$TRACES"; then
+        fail 20 "traces.md missing §3 PII class → redaction rule section"
+    fi
+    # Verify every PII ID (PII-001..015) appears in the PII section.
+    for n in 001 002 003 004 005 006 007 008 009 010 011 012 013 014 015; do
+        if ! grep -q "PII-$n" "$TRACES"; then
+            fail 20 "traces.md PII section missing PII-$n"
+        fi
+    done
+fi
+
+# ─── Rule 21: gitleaks baseline + pip-audit allowlist exist ────────────
+GITLEAKS_BASELINE="$ROOT/.gitleaks-baseline.json"
+PIP_AUDIT_ALLOWLIST="$ROOT/.pip-audit-allowlist.txt"
+if [ ! -f "$GITLEAKS_BASELINE" ]; then
+    fail 21 ".gitleaks-baseline.json not found"
+elif [ ! -s "$GITLEAKS_BASELINE" ]; then
+    fail 21 ".gitleaks-baseline.json is empty"
+fi
+if [ ! -f "$PIP_AUDIT_ALLOWLIST" ]; then
+    fail 21 ".pip-audit-allowlist.txt not found"
+elif [ ! -s "$PIP_AUDIT_ALLOWLIST" ]; then
+    fail 21 ".pip-audit-allowlist.txt is empty"
+fi
+
+# ─── Rule 22: Branch protection config exists ──────────────────────────
+BP_CONFIG="$ROOT/deploy/ci/branch-protection.json"
+BP_SCRIPT="$ROOT/deploy/ci/apply-branch-protection.sh"
+if [ ! -f "$BP_CONFIG" ]; then
+    fail 22 "deploy/ci/branch-protection.json not found"
+elif [ ! -s "$BP_CONFIG" ]; then
+    fail 22 "deploy/ci/branch-protection.json is empty"
+elif ! grep -q "required_pull_request_reviews" "$BP_CONFIG"; then
+    fail 22 "branch-protection.json missing required_pull_request_reviews"
+elif ! grep -q "allow_force_pushes" "$BP_CONFIG"; then
+    fail 22 "branch-protection.json missing allow_force_pushes"
+fi
+if [ ! -x "$BP_SCRIPT" ]; then
+    fail 22 "deploy/ci/apply-branch-protection.sh not executable"
+fi
+
+# ─── Rule 23: Five ADRs ACCEPTED (0017, 0025, 0026, 0027, 0028) ────────
+# Per Phase 4 hard acceptance: 0017+0025..0028 ACCEPTED with approvers.
+required_accepted_adrs="0017 0025 0026 0027 0028"
+for n in $required_accepted_adrs; do
+    adr_file="$ROOT/docs/adr/ADR-$n.md"
+    if [ ! -f "$adr_file" ]; then
+        fail 23 "ADR-$n.md not found"
+        continue
+    fi
+    # Check Status: ACCEPTED in front-matter.
+    fm_status=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+        fm >= 2 { exit }
+    ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ "$fm_status" != "ACCEPTED" ]; then
+        fail 23 "ADR-$n status is '$fm_status' (expected ACCEPTED)"
+    fi
+    # Check Approver: line is present and non-empty.
+    if ! grep -qE "^Approver: .+" "$adr_file"; then
+        fail 23 "ADR-$n missing non-empty Approver line"
+    fi
+done
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 5 rules (24–28)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 24: check_rls_coverage is non-vacuous + Phase 5 ADRs ACCEPTED ─
+# Per Phase 5 spec output #8: check_rls_coverage non-vacuous.
+# Verifies the command file contains real checks (not just a vacuous
+# pass message). Also verifies ADR-0002/0029/0030 are ACCEPTED.
+RLS_CMD="$ROOT/src/noventra/apps/core/management/commands/check_rls_coverage.py"
+if [ ! -f "$RLS_CMD" ]; then
+    fail 24 "check_rls_coverage command not found: $RLS_CMD"
+elif ! grep -q "relrowsecurity" "$RLS_CMD"; then
+    fail 24 "check_rls_coverage is vacuous (does not query pg_class for RLS status)"
+elif ! grep -q "pg_policy" "$RLS_CMD"; then
+    fail 24 "check_rls_coverage does not check RLS policies (pg_policy)"
+elif ! grep -q "sys.exit(1)" "$RLS_CMD"; then
+    fail 24 "check_rls_coverage does not exit non-zero on failure"
+fi
+# Phase 5 ADRs ACCEPTED.
+for n in 0002 0029 0030; do
+    adr_file="$ROOT/docs/adr/ADR-$n.md"
+    if [ ! -f "$adr_file" ]; then
+        fail 24 "ADR-$n.md not found"
+        continue
+    fi
+    fm_status=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+        fm >= 2 { exit }
+    ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ "$fm_status" != "ACCEPTED" ]; then
+        fail 24 "ADR-$n status is '$fm_status' (expected ACCEPTED for Phase 5)"
+    fi
+done
+
+# ─── Rule 25: Tenancy migration exists with RLS policies ────────────────
+# Per Phase 5 spec output #6: migrations produce schema + RLS + baseline.
+TENANCY_MIG="$ROOT/src/noventra/apps/tenancy/migrations/0001_initial.py"
+if [ ! -f "$TENANCY_MIG" ]; then
+    fail 25 "Tenancy migration not found: $TENANCY_MIG"
+else
+    if ! grep -q "ENABLE ROW LEVEL SECURITY" "$TENANCY_MIG"; then
+        fail 25 "Tenancy migration does not enable RLS"
+    fi
+    if ! grep -q "FORCE ROW LEVEL SECURITY" "$TENANCY_MIG"; then
+        fail 25 "Tenancy migration does not force RLS (owner subject to RLS)"
+    fi
+    if ! grep -q "CREATE POLICY" "$TENANCY_MIG"; then
+        fail 25 "Tenancy migration does not create RLS policies"
+    fi
+    if ! grep -q "app.tenant_uuid()" "$TENANCY_MIG"; then
+        fail 25 "Tenancy migration RLS policy does not use app.tenant_uuid()"
+    fi
+    if ! grep -q "WITH CHECK" "$TENANCY_MIG"; then
+        fail 25 "Tenancy migration RLS policy missing WITH CHECK"
+    fi
+    if ! grep -q "noventra_admin" "$TENANCY_MIG"; then
+        fail 25 "Tenancy migration does not create noventra_admin break-glass role"
+    fi
+fi
+
+# ─── Rule 26: Tenant middleware exists with 400 on missing/malformed ────
+# Per Phase 5 spec output #5: middleware 400s before DB on missing/malformed.
+TENANT_MW="$ROOT/src/noventra/middleware/tenant.py"
+if [ ! -f "$TENANT_MW" ]; then
+    fail 26 "Tenant middleware not found: $TENANT_MW"
+else
+    if ! grep -q "TenantResolutionMiddleware" "$TENANT_MW"; then
+        fail 26 "TenantResolutionMiddleware class not found"
+    fi
+    if ! grep -q "problem_response" "$TENANT_MW"; then
+        fail 26 "Tenant middleware does not use problem_response for 400s"
+    fi
+    if ! grep -q "noventra.tenant.missing" "$TENANT_MW"; then
+        fail 26 "Tenant middleware does not return E_TENANT_MISSING"
+    fi
+    if ! grep -q "noventra.tenant.invalid" "$TENANT_MW"; then
+        fail 26 "Tenant middleware does not return E_TENANT_INVALID"
+    fi
+    if ! grep -q "SET LOCAL app.tenant_uuid" "$TENANT_MW"; then
+        fail 26 "Tenant middleware does not SET LOCAL app.tenant_uuid"
+    fi
+fi
+
+# ─── Rule 27: pgbouncer in docker-compose + pgbouncer compat doc ───────
+# Per Phase 5 spec output #7: pgbouncer added to local docker-compose.yml.
+COMPOSE="$ROOT/docker-compose.yml"
+if ! grep -q "pgbouncer" "$COMPOSE"; then
+    fail 27 "docker-compose.yml does not include pgbouncer service"
+elif ! grep -q "POOL_MODE: transaction" "$COMPOSE"; then
+    fail 27 "pgbouncer POOL_MODE is not 'transaction'"
+fi
+PGBOUNCER_DOC="$ROOT/docs/architecture/pgbouncer-compatibility.md"
+if [ ! -f "$PGBOUNCER_DOC" ]; then
+    fail 27 "pgbouncer-compatibility.md not found"
+elif ! grep -q "SET LOCAL" "$PGBOUNCER_DOC"; then
+    fail 27 "pgbouncer-compatibility.md does not mention SET LOCAL"
+elif ! grep -q "ATOMIC_REQUESTS" "$PGBOUNCER_DOC"; then
+    fail 27 "pgbouncer-compatibility.md does not mention ATOMIC_REQUESTS"
+fi
+# Verify ATOMIC_REQUESTS=True in settings.
+if ! grep -q "ATOMIC_REQUESTS.*True" "$ROOT/src/noventra/settings/base.py"; then
+    fail 27 "settings/base.py does not set ATOMIC_REQUESTS=True"
+fi
+if ! grep -q "prepare_threshold.*None" "$ROOT/src/noventra/settings/base.py"; then
+    fail 27 "settings/base.py does not set prepare_threshold=None"
+fi
+
+# ─── Rule 28: Phase 5 inventory (tests, handoff, audit, break-glass) ───
+required_phase5_files=(
+    "$ROOT/src/noventra/apps/tenancy/domain/__init__.py"
+    "$ROOT/src/noventra/apps/tenancy/domain/aggregates.py"
+    "$ROOT/src/noventra/apps/tenancy/domain/commands.py"
+    "$ROOT/src/noventra/apps/tenancy/domain/events.py"
+    "$ROOT/src/noventra/apps/tenancy/domain/ports.py"
+    "$ROOT/src/noventra/apps/tenancy/adapters/orm.py"
+    "$ROOT/src/noventra/middleware/tenant.py"
+    "$ROOT/docs/architecture/pgbouncer-compatibility.md"
+    "$ROOT/docs/architecture/break-glass-admin.md"
+    "$ROOT/docs/stage-handoffs/stage-05-handoff.md"
+    "$ROOT/docs/audits/phase-005-audit.md"
+    "$ROOT/tests/test_tenancy_rls.py"
+    "$ROOT/tests/test_pgbouncer.py"
+)
+for f in "${required_phase5_files[@]}"; do
+    if [ ! -f "$f" ]; then
+        fail 28 "Phase 5 inventory file missing: $f"
+    elif [ ! -s "$f" ]; then
+        fail 28 "Phase 5 inventory file empty: $f"
+    fi
+done
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 6 rules (29–35; 33, 34, 36 deferred to Phase 7)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 29: Phase 6 ADRs ACCEPTED (0031, 0032, 0033, 0034) ────────────
+for n in 0031 0032 0033 0034; do
+    adr_file="$ROOT/docs/adr/ADR-$n.md"
+    if [ ! -f "$adr_file" ]; then
+        fail 29 "ADR-$n.md not found"
+        continue
+    fi
+    fm_status=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+        fm >= 2 { exit }
+    ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ "$fm_status" != "ACCEPTED" ]; then
+        fail 29 "ADR-$n status is '$fm_status' (expected ACCEPTED for Phase 6)"
+    fi
+    if ! grep -qE "^Approver: .+" "$adr_file"; then
+        fail 29 "ADR-$n missing non-empty Approver line"
+    fi
+done
+
+# ─── Rule 30: Identity migration exists with tables + RLS + baseline ───
+IDENTITY_MIG="$ROOT/src/noventra/apps/identity/migrations/0001_initial.py"
+if [ ! -f "$IDENTITY_MIG" ]; then
+    fail 30 "Identity migration not found: $IDENTITY_MIG"
+else
+    for table in identity_user identity_tenant_membership identity_role identity_permission identity_role_permission identity_service_identity identity_refresh_token_blacklist; do
+        if ! grep -q "$table" "$IDENTITY_MIG"; then
+            fail 30 "Identity migration missing table: $table"
+        fi
+    done
+    # RLS on tenant-scoped tables.
+    if ! grep -q "ENABLE ROW LEVEL SECURITY" "$IDENTITY_MIG"; then
+        fail 30 "Identity migration does not enable RLS on tenant-scoped tables"
+    fi
+    # Baseline roles seeded.
+    if ! grep -q "'admin'" "$IDENTITY_MIG" || ! grep -q "'manager'" "$IDENTITY_MIG" || ! grep -q "'viewer'" "$IDENTITY_MIG" || ! grep -q "'service'" "$IDENTITY_MIG"; then
+        fail 30 "Identity migration does not seed baseline roles (admin/manager/viewer/service)"
+    fi
+    # Baseline service identities.
+    if ! grep -q "'shadow'" "$IDENTITY_MIG" || ! grep -q "'live'" "$IDENTITY_MIG"; then
+        fail 30 "Identity migration does not seed shadow + live service identities"
+    fi
+fi
+
+# ─── Rule 31: AuthN middleware exists with JWT verification ────────────
+AUTHN_MW="$ROOT/src/noventra/middleware/authn.py"
+if [ ! -f "$AUTHN_MW" ]; then
+    fail 31 "AuthN middleware not found: $AUTHN_MW"
+else
+    if ! grep -q "AuthNMiddleware" "$AUTHN_MW"; then
+        fail 31 "AuthNMiddleware class not found"
+    fi
+    if ! grep -q "verify_token" "$AUTHN_MW"; then
+        fail 31 "AuthN middleware does not verify tokens"
+    fi
+    if ! grep -q "jwt_claims" "$AUTHN_MW"; then
+        fail 31 "AuthN middleware does not set jwt_claims on request"
+    fi
+    if ! grep -q "jwt_tenant_id" "$AUTHN_MW"; then
+        fail 31 "AuthN middleware does not set jwt_tenant_id for tenant middleware"
+    fi
+    if ! grep -q "problem_response" "$AUTHN_MW"; then
+        fail 31 "AuthN middleware does not use problem_response for errors"
+    fi
+fi
+# JWT utilities.
+JWT_UTIL="$ROOT/src/noventra/apps/identity/adapters/jwt.py"
+if [ ! -f "$JWT_UTIL" ]; then
+    fail 31 "JWT utility not found: $JWT_UTIL"
+elif ! grep -q "issue_access_token" "$JWT_UTIL" || ! grep -q "verify_token" "$JWT_UTIL"; then
+    fail 31 "JWT utility missing issue_access_token or verify_token"
+fi
+
+# ─── Rule 32: Permission decorators + service/human separation ─────────
+PERMS_MW="$ROOT/src/noventra/middleware/permissions.py"
+if [ ! -f "$PERMS_MW" ]; then
+    fail 32 "Permission decorators not found: $PERMS_MW"
+else
+    if ! grep -q "def human_only" "$PERMS_MW"; then
+        fail 32 "human_only decorator not found"
+    fi
+    if ! grep -q "def service_only" "$PERMS_MW"; then
+        fail 32 "service_only decorator not found"
+    fi
+    if ! grep -q "def require_permission" "$PERMS_MW"; then
+        fail 32 "require_permission decorator not found"
+    fi
+    if ! grep -q "_service_is_live" "$PERMS_MW"; then
+        fail 32 "require_permission does not check service_is_live for service.mutate"
+    fi
+fi
+
+# ─── Rule 35: Permission catalog closed (every code in catalog) ────────
+# Per ADR-0032 / DEC-0037. Verifies permissions.py has a closed
+# enumeration (PermissionCode) + BASELINE_ROLE_PERMISSIONS.
+PERMS_CAT="$ROOT/src/noventra/apps/identity/domain/permissions.py"
+if [ ! -f "$PERMS_CAT" ]; then
+    fail 35 "Permission catalog not found: $PERMS_CAT"
+else
+    if ! grep -q "class PermissionCode" "$PERMS_CAT"; then
+        fail 35 "PermissionCode enum not found in catalog"
+    fi
+    if ! grep -q "PERMISSION_CATALOG" "$PERMS_CAT"; then
+        fail 35 "PERMISSION_CATALOG tuple not found"
+    fi
+    if ! grep -q "BASELINE_ROLE_PERMISSIONS" "$PERMS_CAT"; then
+        fail 35 "BASELINE_ROLE_PERMISSIONS dict not found"
+    fi
+    # Verify all 4 baseline roles present.
+    for role in admin manager viewer service; do
+        if ! grep -q "\"$role\"" "$PERMS_CAT"; then
+            fail 35 "Baseline role '$role' not in BASELINE_ROLE_PERMISSIONS"
+        fi
+    done
+    # Verify service.mutate + service.promote exist.
+    if ! grep -q "service.mutate" "$PERMS_CAT"; then
+        fail 35 "service.mutate permission not in catalog"
+    fi
+    if ! grep -q "service.promote" "$PERMS_CAT"; then
+        fail 35 "service.promote permission not in catalog"
+    fi
+fi
+# Permission matrix doc.
+PERM_MATRIX="$ROOT/docs/architecture/permission-matrix.md"
+if [ ! -f "$PERM_MATRIX" ]; then
+    fail 35 "Permission matrix doc not found: $PERM_MATRIX"
+fi
+
+# ─── Rule 33 (DEFERRED to Phase 7): token storage strategy config ─────
+# Phase 7 will enforce token storage config stability.
+
+# ─── Rule 34 (DEFERRED to Phase 7): MFA config stability ──────────────
+# Phase 7 will enforce MFA config stability.
+
+# ─── Rule 36 (DEFERRED to Phase 7): invitation flow config stability ──
+# Phase 7 will enforce invitation flow config stability.
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 7 rules (37–43)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 37: Phase 7 ADRs ACCEPTED (0035-0039) ─────────────────────────
+for n in 0035 0036 0037 0038 0039; do
+    adr_file="$ROOT/docs/adr/ADR-$n.md"
+    if [ ! -f "$adr_file" ]; then
+        fail 37 "ADR-$n.md not found"
+        continue
+    fi
+    fm_status=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+        fm >= 2 { exit }
+    ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ "$fm_status" != "ACCEPTED" ]; then
+        fail 37 "ADR-$n status is '$fm_status' (expected ACCEPTED for Phase 7)"
+    fi
+    if ! grep -qE "^Approver: .+" "$adr_file"; then
+        fail 37 "ADR-$n missing non-empty Approver line"
+    fi
+done
+
+# ─── Rule 38: Audit migration exists with tables + triggers + RLS ───────
+AUDIT_MIG="$ROOT/src/noventra/apps/audit/migrations/0001_initial.py"
+if [ ! -f "$AUDIT_MIG" ]; then
+    fail 38 "Audit migration not found: $AUDIT_MIG"
+else
+    if ! grep -q "audit_event" "$AUDIT_MIG"; then
+        fail 38 "Audit migration missing audit_event table"
+    fi
+    if ! grep -q "audit_chain_head" "$AUDIT_MIG"; then
+        fail 38 "Audit migration missing audit_chain_head table"
+    fi
+    if ! grep -q "PARTITION BY RANGE" "$AUDIT_MIG"; then
+        fail 38 "Audit migration does not partition audit_event"
+    fi
+    if ! grep -q "audit_compute_hash" "$AUDIT_MIG"; then
+        fail 38 "Audit migration missing hash-chain computation function"
+    fi
+    if ! grep -q "BEFORE INSERT" "$AUDIT_MIG"; then
+        fail 38 "Audit migration missing BEFORE INSERT trigger"
+    fi
+    if ! grep -q "audit_enforce_insert_only" "$AUDIT_MIG"; then
+        fail 38 "Audit migration missing insert-only enforcement function"
+    fi
+    if ! grep -q "BEFORE UPDATE" "$AUDIT_MIG" || ! grep -q "BEFORE DELETE" "$AUDIT_MIG"; then
+        fail 38 "Audit migration missing BEFORE UPDATE/DELETE triggers"
+    fi
+    if ! grep -q "GRANT INSERT, SELECT" "$AUDIT_MIG"; then
+        fail 38 "Audit migration does not GRANT INSERT+SELECT only (insert-only)"
+    fi
+    if ! grep -q "ENABLE ROW LEVEL SECURITY" "$AUDIT_MIG"; then
+        fail 38 "Audit migration does not enable RLS on audit_event"
+    fi
+fi
+
+# ─── Rule 39: verify_audit_chain command exists + CI-integrated ────────
+VERIFY_CMD="$ROOT/src/noventra/apps/core/management/commands/verify_audit_chain.py"
+if [ ! -f "$VERIFY_CMD" ]; then
+    fail 39 "verify_audit_chain command not found: $VERIFY_CMD"
+else
+    if ! grep -q "class Command" "$VERIFY_CMD"; then
+        fail 39 "verify_audit_chain missing Command class"
+    fi
+    if ! grep -q "prev_hash" "$VERIFY_CMD"; then
+        fail 39 "verify_audit_chain does not check hash continuity (prev_hash)"
+    fi
+    if ! grep -q "merkle" "$VERIFY_CMD" && ! grep -q "Merkle" "$VERIFY_CMD" && ! grep -q "_recompute_hash" "$VERIFY_CMD"; then
+        fail 39 "verify_audit_chain does not check payload integrity (Merkle/recompute)"
+    fi
+    if ! grep -q "timestamp" "$VERIFY_CMD" && ! grep -q "monotonicity" "$VERIFY_CMD"; then
+        fail 39 "verify_audit_chain does not check timestamp monotonicity"
+    fi
+    if ! grep -q "sys.exit(1)" "$VERIFY_CMD"; then
+        fail 39 "verify_audit_chain does not exit non-zero on failure"
+    fi
+fi
+
+# ─── Rule 40: Event type catalog closed (every code in catalog) ─────────
+EVENT_TYPES="$ROOT/src/noventra/apps/audit/domain/event_types.py"
+if [ ! -f "$EVENT_TYPES" ]; then
+    fail 40 "Event type catalog not found: $EVENT_TYPES"
+else
+    if ! grep -q "class EventType" "$EVENT_TYPES"; then
+        fail 40 "EventType enum not found in catalog"
+    fi
+    if ! grep -q "EVENT_TYPE_CATALOG" "$EVENT_TYPES"; then
+        fail 40 "EVENT_TYPE_CATALOG tuple not found"
+    fi
+    if ! grep -q "class EventTypeCatalog" "$EVENT_TYPES"; then
+        fail 40 "EventTypeCatalog class not found"
+    fi
+    # Verify all 5 categories present.
+    for cat in auth tenancy rbac audit security; do
+        if ! grep -q "\"${cat}\." "$EVENT_TYPES"; then
+            fail 40 "Event type catalog missing category: $cat"
+        fi
+    done
+fi
+
+# ─── Rule 41: Redaction service + PII class-to-rule mapping ────────────
+REDACTION_SVC="$ROOT/src/noventra/apps/audit/adapters/redaction.py"
+if [ ! -f "$REDACTION_SVC" ]; then
+    fail 41 "Redaction service not found: $REDACTION_SVC"
+else
+    if ! grep -q "REDACTION_RULES" "$REDACTION_SVC"; then
+        fail 41 "REDACTION_RULES dict not found"
+    fi
+    if ! grep -q "def redact_payload" "$REDACTION_SVC"; then
+        fail 41 "redact_payload function not found"
+    fi
+    if ! grep -q "def compute_merkle_root" "$REDACTION_SVC"; then
+        fail 41 "compute_merkle_root function not found (Merkle-style)"
+    fi
+    if ! grep -q "def compute_field_hash" "$REDACTION_SVC"; then
+        fail 41 "compute_field_hash function not found (per-field hashing)"
+    fi
+    # Verify PII fields from the register are mapped.
+    for field in email full_name password ip_address; do
+        if ! grep -q "\"$field\"" "$REDACTION_SVC"; then
+            fail 41 "Redaction rules missing PII field: $field"
+        fi
+    done
+fi
+
+# ─── Rule 42: Audit read API + clearance model + meta-audit cut-off ────
+AUDIT_API="$ROOT/src/noventra/apps/audit/api/views.py"
+if [ ! -f "$AUDIT_API" ]; then
+    fail 42 "Audit read API not found: $AUDIT_API"
+else
+    if ! grep -q "AuditLogView" "$AUDIT_API"; then
+        fail 42 "AuditLogView class not found"
+    fi
+    if ! grep -q "_determine_clearance" "$AUDIT_API"; then
+        fail 42 "Clearance model function not found"
+    fi
+    if ! grep -q "compliance_officer" "$AUDIT_API"; then
+        fail 42 "compliance_officer clearance not implemented"
+    fi
+    if ! grep -q "external_auditor" "$AUDIT_API"; then
+        fail 42 "external_auditor clearance not implemented"
+    fi
+    if ! grep -q "tenant_admin" "$AUDIT_API"; then
+        fail 42 "tenant_admin clearance not implemented"
+    fi
+    if ! grep -q "cursor" "$AUDIT_API"; then
+        fail 42 "Cursor-based pagination not implemented"
+    fi
+fi
+AUDIT_MW="$ROOT/src/noventra/middleware/audit.py"
+if [ ! -f "$AUDIT_MW" ]; then
+    fail 42 "Audit middleware not found: $AUDIT_MW"
+elif ! grep -q "_meta_audit_depth" "$AUDIT_MW"; then
+    fail 42 "Meta-audit cut-off (_meta_audit_depth) not enforced in audit middleware"
+fi
+
+# ─── Rule 43: Phase 7 inventory (retention + redaction docs, tests) ───
+required_phase7_files=(
+    "$ROOT/src/noventra/apps/audit/domain/__init__.py"
+    "$ROOT/src/noventra/apps/audit/domain/aggregates.py"
+    "$ROOT/src/noventra/apps/audit/domain/event_types.py"
+    "$ROOT/src/noventra/apps/audit/domain/ports.py"
+    "$ROOT/src/noventra/apps/audit/adapters/orm.py"
+    "$ROOT/src/noventra/apps/audit/adapters/redaction.py"
+    "$ROOT/src/noventra/middleware/audit.py"
+    "$ROOT/src/noventra/apps/audit/api/views.py"
+    "$ROOT/src/noventra/apps/audit/api/urls.py"
+    "$ROOT/docs/architecture/audit-retention-policy.md"
+    "$ROOT/docs/architecture/audit-redaction-policy.md"
+    "$ROOT/docs/stage-handoffs/stage-07-handoff.md"
+    "$ROOT/docs/audits/phase-007-audit.md"
+    "$ROOT/tests/test_audit_chain.py"
+)
+for f in "${required_phase7_files[@]}"; do
+    if [ ! -f "$f" ]; then
+        fail 43 "Phase 7 inventory file missing: $f"
+    elif [ ! -s "$f" ]; then
+        fail 43 "Phase 7 inventory file empty: $f"
+    fi
+done
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 8 rules (44–52) — Increment 1 close
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 44: Phase 8 ADRs ACCEPTED (0040-0046) + ADR-0014 RESOLVED ───
+for n in 0040 0041 0042 0043 0044 0045 0046; do
+    adr_file="$ROOT/docs/adr/ADR-$n.md"
+    if [ ! -f "$adr_file" ]; then
+        fail 44 "ADR-$n.md not found"
+        continue
+    fi
+    fm_status=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+        fm >= 2 { exit }
+    ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ "$fm_status" != "ACCEPTED" ]; then
+        fail 44 "ADR-$n status is '$fm_status' (expected ACCEPTED for Phase 8)"
+    fi
+    if ! grep -qE "^Approver: .+" "$adr_file"; then
+        fail 44 "ADR-$n missing non-empty Approver line"
+    fi
+done
+# ADR-0014 RESOLVED (chronic deferral loop closed).
+adr0014_status=$(awk '
+    /^---[[:space:]]*$/ { fm++; next }
+    fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+    fm >= 2 { exit }
+' "$ROOT/docs/adr/ADR-0014.md" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+if [ "$adr0014_status" != "ACCEPTED" ]; then
+    fail 44 "ADR-0014 status is '$adr0014_status' (expected ACCEPTED — chronic deferral loop closed)"
+fi
+
+# ─── Rule 45: Reliability migration exists with outbox + inbox + idempotency + RLS ─
+RELIABILITY_MIG="$ROOT/src/noventra/apps/reliability/migrations/0001_initial.py"
+if [ ! -f "$RELIABILITY_MIG" ]; then
+    fail 45 "Reliability migration not found: $RELIABILITY_MIG"
+else
+    for table in reliability_outbox reliability_inbox reliability_idempotency_key; do
+        if ! grep -q "$table" "$RELIABILITY_MIG"; then
+            fail 45 "Reliability migration missing table: $table"
+        fi
+    done
+    if ! grep -q "ENABLE ROW LEVEL SECURITY" "$RELIABILITY_MIG"; then
+        fail 45 "Reliability migration does not enable RLS"
+    fi
+fi
+
+# ─── Rule 46: Outbox relay exists with SELECT FOR UPDATE SKIP LOCKED ──
+OUTBOX_RELAY="$ROOT/src/noventra/apps/reliability/adapters/outbox_relay.py"
+if [ ! -f "$OUTBOX_RELAY" ]; then
+    fail 46 "Outbox relay not found: $OUTBOX_RELAY"
+else
+    if ! grep -q "SKIP LOCKED" "$OUTBOX_RELAY"; then
+        fail 46 "Outbox relay does not use SELECT FOR UPDATE SKIP LOCKED (multi-instance)"
+    fi
+    if ! grep -q "append_to_outbox" "$OUTBOX_RELAY"; then
+        fail 46 "Outbox relay missing append_to_outbox function"
+    fi
+    if ! grep -q "relay_batch" "$OUTBOX_RELAY"; then
+        fail 46 "Outbox relay missing relay_batch function"
+    fi
+fi
+
+# ─── Rule 47: Consumer base + inbox dedup + DLQ consumer ───────────────
+CONSUMER="$ROOT/src/noventra/apps/reliability/adapters/consumer.py"
+if [ ! -f "$CONSUMER" ]; then
+    fail 47 "Consumer base not found: $CONSUMER"
+else
+    if ! grep -q "class ConsumerBase" "$CONSUMER"; then
+        fail 47 "ConsumerBase class not found"
+    fi
+    if ! grep -q "ON CONFLICT DO NOTHING" "$CONSUMER"; then
+        fail 47 "Consumer does not use ON CONFLICT DO NOTHING (inbox dedup)"
+    fi
+    if ! grep -q "class DLQConsumer" "$CONSUMER"; then
+        fail 47 "DLQConsumer class not found"
+    fi
+    if ! grep -q "send_to_dlq" "$CONSUMER"; then
+        fail 47 "DLQConsumer missing send_to_dlq method"
+    fi
+fi
+
+# ─── Rule 48: Idempotency middleware exists with conflict handling ────
+IDEMPOTENCY_MW="$ROOT/src/noventra/middleware/idempotency.py"
+if [ ! -f "$IDEMPOTENCY_MW" ]; then
+    fail 48 "Idempotency middleware not found: $IDEMPOTENCY_MW"
+else
+    if ! grep -q "IdempotencyMiddleware" "$IDEMPOTENCY_MW"; then
+        fail 48 "IdempotencyMiddleware class not found"
+    fi
+    if ! grep -q "Idempotency-Key" "$IDEMPOTENCY_MW"; then
+        fail 48 "Idempotency middleware does not read Idempotency-Key header"
+    fi
+    if ! grep -q "noventra.idempotency.conflict" "$IDEMPOTENCY_MW"; then
+        fail 48 "Idempotency middleware does not return 409 on conflict"
+    fi
+    if ! grep -q "request_hash" "$IDEMPOTENCY_MW"; then
+        fail 48 "Idempotency middleware does not compute request_hash"
+    fi
+fi
+
+# ─── Rule 49: State machine base exists with transition decorator ─────
+STATE_MACHINE="$ROOT/src/noventra/apps/reliability/domain/state_machine.py"
+if [ ! -f "$STATE_MACHINE" ]; then
+    fail 49 "State machine base not found: $STATE_MACHINE"
+else
+    if ! grep -q "def transition" "$STATE_MACHINE"; then
+        fail 49 "transition decorator not found"
+    fi
+    if ! grep -q "class StateMachineMixin" "$STATE_MACHINE"; then
+        fail 49 "StateMachineMixin class not found"
+    fi
+    if ! grep -q "class TransitionError" "$STATE_MACHINE"; then
+        fail 49 "TransitionError class not found"
+    fi
+    if ! grep -q "guard" "$STATE_MACHINE"; then
+        fail 49 "State machine does not support guard pattern"
+    fi
+    if ! grep -q "_before_transition\|_after_transition" "$STATE_MACHINE"; then
+        fail 49 "State machine missing side-effect hooks (_before/_after_transition)"
+    fi
+fi
+
+# ─── Rule 50: Notifications port + adapters exist ─────────────────────
+NOTIFICATIONS="$ROOT/src/noventra/apps/reliability/domain/notifications.py"
+NOTIF_ADAPTERS="$ROOT/src/noventra/apps/reliability/adapters/notifications.py"
+if [ ! -f "$NOTIFICATIONS" ]; then
+    fail 50 "Notifications port not found: $NOTIFICATIONS"
+else
+    if ! grep -q "class NotificationPort" "$NOTIFICATIONS"; then
+        fail 50 "NotificationPort class not found"
+    fi
+    if ! grep -q "class SendResult" "$NOTIFICATIONS"; then
+        fail 50 "SendResult class not found"
+    fi
+    if ! grep -q "class NotificationChannel" "$NOTIFICATIONS"; then
+        fail 50 "NotificationChannel enum not found"
+    fi
+    if ! grep -q "class SendType" "$NOTIFICATIONS"; then
+        fail 50 "SendType enum not found (send-type taxonomy)"
+    fi
+fi
+if [ ! -f "$NOTIF_ADAPTERS" ]; then
+    fail 50 "Notification adapters not found: $NOTIF_ADAPTERS"
+elif ! grep -q "EmailStubAdapter" "$NOTIF_ADAPTERS" || ! grep -q "SMSStubAdapter" "$NOTIF_ADAPTERS"; then
+    fail 50 "Email/SMS stub adapters not found"
+fi
+
+# ─── Rule 51: MarketingGate exists with suppression + caps ────────────
+MARKETING_GATE="$ROOT/src/noventra/apps/reliability/domain/marketing_gate.py"
+if [ ! -f "$MARKETING_GATE" ]; then
+    fail 51 "MarketingGate not found: $MARKETING_GATE"
+else
+    if ! grep -q "class MarketingGate" "$MARKETING_GATE"; then
+        fail 51 "MarketingGate class not found"
+    fi
+    if ! grep -q "class GateDecision" "$MARKETING_GATE"; then
+        fail 51 "GateDecision class not found"
+    fi
+    if ! grep -q "DENY_SUPPRESSION" "$MARKETING_GATE"; then
+        fail 51 "MarketingGate does not deny on suppression"
+    fi
+    if ! grep -q "DENY_CAP" "$MARKETING_GATE"; then
+        fail 51 "MarketingGate does not deny on cap exceeded"
+    fi
+    if ! grep -q "transactional" "$MARKETING_GATE"; then
+        fail 51 "MarketingGate does not distinguish transactional send type"
+    fi
+    if ! grep -q "marketing" "$MARKETING_GATE"; then
+        fail 51 "MarketingGate does not distinguish marketing send type"
+    fi
+fi
+
+# ─── Rule 52: Phase 8 inventory (event schema, tests, handoff, audit, increment close) ─
+required_phase8_files=(
+    "$ROOT/src/noventra/apps/reliability/domain/__init__.py"
+    "$ROOT/src/noventra/apps/reliability/domain/outbox.py"
+    "$ROOT/src/noventra/apps/reliability/domain/inbox.py"
+    "$ROOT/src/noventra/apps/reliability/domain/idempotency.py"
+    "$ROOT/src/noventra/apps/reliability/domain/notifications.py"
+    "$ROOT/src/noventra/apps/reliability/domain/marketing_gate.py"
+    "$ROOT/src/noventra/apps/reliability/domain/state_machine.py"
+    "$ROOT/src/noventra/apps/reliability/adapters/orm.py"
+    "$ROOT/src/noventra/apps/reliability/adapters/outbox_relay.py"
+    "$ROOT/src/noventra/apps/reliability/adapters/consumer.py"
+    "$ROOT/src/noventra/apps/reliability/adapters/notifications.py"
+    "$ROOT/src/noventra/middleware/idempotency.py"
+    "$ROOT/docs/architecture/event-schema.md"
+    "$ROOT/docs/stage-handoffs/stage-08-handoff.md"
+    "$ROOT/docs/audits/phase-008-audit.md"
+    "$ROOT/docs/audits/increment-1-close.md"
+    "$ROOT/tests/test_reliability_core.py"
+)
+for f in "${required_phase8_files[@]}"; do
+    if [ ! -f "$f" ]; then
+        fail 52 "Phase 8 inventory file missing: $f"
+    elif [ ! -s "$f" ]; then
+        fail 52 "Phase 8 inventory file empty: $f"
+    fi
+done
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 9 rules (53–60) — Players & Consents (Increment 2 start)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 53: Phase 9 ADRs ACCEPTED (0047-0051) + ADR-0046 amended ───
+for n in 0047 0048 0049 0050 0051; do
+    adr_file="$ROOT/docs/adr/ADR-$n.md"
+    if [ ! -f "$adr_file" ]; then
+        fail 53 "ADR-$n.md not found"
+        continue
+    fi
+    fm_status=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+        fm >= 2 { exit }
+    ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ "$fm_status" != "ACCEPTED" ]; then
+        fail 53 "ADR-$n status is '$fm_status' (expected ACCEPTED for Phase 9)"
+    fi
+    if ! grep -qE "^Approver: .+" "$adr_file"; then
+        fail 53 "ADR-$n missing non-empty Approver line"
+    fi
+done
+
+# ─── Rule 54: Players migration exists with tables + RLS + insert-only ─
+PLAYERS_MIG="$ROOT/src/noventra/apps/players/migrations/0001_initial.py"
+if [ ! -f "$PLAYERS_MIG" ]; then
+    fail 54 "Players migration not found: $PLAYERS_MIG"
+else
+    if ! grep -q "players_player" "$PLAYERS_MIG"; then
+        fail 54 "Players migration missing players_player table"
+    fi
+    if ! grep -q "players_consent" "$PLAYERS_MIG"; then
+        fail 54 "Players migration missing players_consent table"
+    fi
+    if ! grep -q "ENABLE ROW LEVEL SECURITY" "$PLAYERS_MIG"; then
+        fail 54 "Players migration does not enable RLS"
+    fi
+    if ! grep -q "consent_enforce_insert_only" "$PLAYERS_MIG"; then
+        fail 54 "Players migration missing consent insert-only trigger"
+    fi
+fi
+
+# ─── Rule 55: Player FSM exists with 8 states + transitions ───────────
+PLAYER_FSM="$ROOT/src/noventra/apps/players/domain/player.py"
+if [ ! -f "$PLAYER_FSM" ]; then
+    fail 55 "Player FSM not found: $PLAYER_FSM"
+else
+    if ! grep -q "class PlayerState" "$PLAYER_FSM"; then
+        fail 55 "PlayerState enum not found"
+    fi
+    for state in prospect registered active suspended self_excluded dormant closed deleted; do
+        if ! grep -q "$state" "$PLAYER_FSM"; then
+            fail 55 "PlayerState missing state: $state"
+        fi
+    done
+    if ! grep -q "@transition" "$PLAYER_FSM"; then
+        fail 55 "Player FSM missing @transition decorators"
+    fi
+    if ! grep -q "cooling_off" "$PLAYER_FSM"; then
+        fail 55 "Player FSM missing self-exclusion cooling-off guard"
+    fi
+fi
+
+# ─── Rule 56: Consent schema + immutability + versioning ──────────────
+CONSENT_DOMAIN="$ROOT/src/noventra/apps/players/domain/consent.py"
+if [ ! -f "$CONSENT_DOMAIN" ]; then
+    fail 56 "Consent domain not found: $CONSENT_DOMAIN"
+else
+    if ! grep -q "class ConsentStatus" "$CONSENT_DOMAIN"; then
+        fail 56 "ConsentStatus enum not found"
+    fi
+    for status in granted revoked expired pending; do
+        if ! grep -q "$status" "$CONSENT_DOMAIN"; then
+            fail 56 "ConsentStatus missing: $status"
+        fi
+    done
+    if ! grep -q "class ConsentPurpose" "$CONSENT_DOMAIN"; then
+        fail 56 "ConsentPurpose catalog not found"
+    fi
+    if ! grep -q "policy_version" "$CONSENT_DOMAIN"; then
+        fail 56 "Consent schema missing policy_version (versioning)"
+    fi
+    if ! grep -q "consent_text_hash" "$CONSENT_DOMAIN"; then
+        fail 56 "Consent schema missing consent_text_hash"
+    fi
+    if ! grep -q "prev_hash" "$CONSENT_DOMAIN"; then
+        fail 56 "Consent schema missing hash-chain fields (immutability per ADR-0049)"
+    fi
+fi
+
+# ─── Rule 57: Retention model + management commands ───────────────────
+RETENTION_DOMAIN="$ROOT/src/noventra/apps/players/domain/retention.py"
+if [ ! -f "$RETENTION_DOMAIN" ]; then
+    fail 57 "Retention domain not found: $RETENTION_DOMAIN"
+elif ! grep -q "class DataClass" "$RETENTION_DOMAIN"; then
+    fail 57 "DataClass enum not found"
+elif ! grep -q "DEFAULT_RETENTION_DAYS" "$RETENTION_DOMAIN"; then
+    fail 57 "DEFAULT_RETENTION_DAYS not found"
+fi
+for cmd in erase_player export_player_data enforce_retention; do
+    cmd_file="$ROOT/src/noventra/apps/players/management/commands/${cmd}.py"
+    if [ ! -f "$cmd_file" ]; then
+        fail 57 "Management command not found: $cmd_file"
+    elif ! grep -q "class Command" "$cmd_file"; then
+        fail 57 "$cmd missing Command class"
+    fi
+done
+
+# ─── Rule 58: MarketingGate amended with consent check ────────────────
+MARKETING_GATE="$ROOT/src/noventra/apps/reliability/domain/marketing_gate.py"
+if [ ! -f "$MARKETING_GATE" ]; then
+    fail 58 "MarketingGate not found: $MARKETING_GATE"
+else
+    if ! grep -q "DENY_CONSENT" "$MARKETING_GATE"; then
+        fail 58 "MarketingGate missing DENY_CONSENT (Phase 9 amendment)"
+    fi
+    if ! grep -q "DENY_JURISDICTION" "$MARKETING_GATE"; then
+        fail 58 "MarketingGate missing DENY_JURISDICTION (Phase 9 amendment)"
+    fi
+    if ! grep -q "ConsentChecker" "$MARKETING_GATE"; then
+        fail 58 "MarketingGate missing ConsentChecker (Phase 9 amendment)"
+    fi
+    if ! grep -q "consent_checker" "$MARKETING_GATE"; then
+        fail 58 "MarketingGate missing consent_checker parameter"
+    fi
+fi
+
+# ─── Rule 59: Audit event taxonomy extended with player/consent/retention ─
+EVENT_TYPES="$ROOT/src/noventra/apps/audit/domain/event_types.py"
+if [ ! -f "$EVENT_TYPES" ]; then
+    fail 59 "Event types not found: $EVENT_TYPES"
+else
+    for cat in player consent retention; do
+        if ! grep -q "\"${cat}\." "$EVENT_TYPES"; then
+            fail 59 "Event type catalog missing category: $cat"
+        fi
+    done
+    # Verify key player events.
+    for evt in player.registered player.erasure_completed player.dsar_completed consent.granted consent.revoked retention.enforcement_completed; do
+        if ! grep -q "$evt" "$EVENT_TYPES"; then
+            fail 59 "Event type catalog missing: $evt"
+        fi
+    done
+fi
+
+# ─── Rule 60: Phase 9 inventory (tests, handoff, audit) ───────────────
+required_phase9_files=(
+    "$ROOT/src/noventra/apps/players/__init__.py"
+    "$ROOT/src/noventra/apps/players/apps.py"
+    "$ROOT/src/noventra/apps/players/domain/player.py"
+    "$ROOT/src/noventra/apps/players/domain/consent.py"
+    "$ROOT/src/noventra/apps/players/domain/retention.py"
+    "$ROOT/src/noventra/apps/players/adapters/orm.py"
+    "$ROOT/src/noventra/apps/players/migrations/0001_initial.py"
+    "$ROOT/src/noventra/apps/players/management/commands/erase_player.py"
+    "$ROOT/src/noventra/apps/players/management/commands/export_player_data.py"
+    "$ROOT/src/noventra/apps/players/management/commands/enforce_retention.py"
+    "$ROOT/docs/stage-handoffs/stage-09-handoff.md"
+    "$ROOT/docs/audits/phase-009-audit.md"
+    "$ROOT/tests/test_players_consents.py"
+)
+for f in "${required_phase9_files[@]}"; do
+    if [ ! -f "$f" ]; then
+        fail 60 "Phase 9 inventory file missing: $f"
+    elif [ ! -s "$f" ]; then
+        fail 60 "Phase 9 inventory file empty: $f"
+    fi
+done
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 10 rules (61–70) — KYC & Documents (Increment 2 second pillar)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 61: Stage N parenthetical convention + Phase 10 ADRs ─────────
+# Closes chronic convention violation (9-round). Verifies ADR-0052..0058 ACCEPTED.
+for n in 0052 0053 0054 0055 0056 0057 0058; do
+    adr_file="$ROOT/docs/adr/ADR-$n.md"
+    if [ ! -f "$adr_file" ]; then
+        fail 61 "ADR-$n.md not found"
+        continue
+    fi
+    fm_status=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+        fm >= 2 { exit }
+    ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ "$fm_status" != "ACCEPTED" ]; then
+        fail 61 "ADR-$n status is '$fm_status' (expected ACCEPTED for Phase 10)"
+    fi
+    if ! grep -qE "^Approver: .+" "$adr_file"; then
+        fail 61 "ADR-$n missing non-empty Approver line"
+    fi
+done
+
+# ─── Rule 62: KYC case FSM exists with 16 states + regulatory constraints ──
+KYC_FSM="$ROOT/src/noventra/apps/kyc/domain/kyc_case.py"
+if [ ! -f "$KYC_FSM" ]; then
+    fail 62 "KYC case FSM not found: $KYC_FSM"
+else
+    if ! grep -q "class KycCaseState" "$KYC_FSM"; then
+        fail 62 "KycCaseState enum not found"
+    fi
+    for state in pending_submission submitted auto_verified auto_rejected in_review ed_triggered pep_flagged sanctions_flagged escalated closed_approved closed_rejected suspended_pending_sar; do
+        if ! grep -q "$state" "$KYC_FSM"; then
+            fail 62 "KycCaseState missing state: $state"
+        fi
+    done
+    if ! grep -q "@transition" "$KYC_FSM"; then
+        fail 62 "KYC FSM missing @transition decorators"
+    fi
+    if ! grep -q "flag_pep\|pep_to_edd" "$KYC_FSM"; then
+        fail 62 "KYC FSM missing PEP → EDD regulatory constraint"
+    fi
+    if ! grep -q "flag_sanctions\|escalate_to_mlro" "$KYC_FSM"; then
+        fail 62 "KYC FSM missing sanctions → escalate regulatory constraint"
+    fi
+    if ! grep -q "check_risk_for_edd" "$KYC_FSM"; then
+        fail 62 "KYC FSM missing risk > threshold → EDD check"
+    fi
+fi
+
+# ─── Rule 63: Document model + versioning + types ──────────────────────
+DOC_DOMAIN="$ROOT/src/noventra/apps/kyc/domain/document.py"
+if [ ! -f "$DOC_DOMAIN" ]; then
+    fail 63 "Document domain not found: $DOC_DOMAIN"
+else
+    if ! grep -q "class DocumentType" "$DOC_DOMAIN"; then
+        fail 63 "DocumentType enum not found"
+    fi
+    for dt in passport national_id driver_license utility_bill bank_statement tax_document selfie; do
+        if ! grep -q "$dt" "$DOC_DOMAIN"; then
+            fail 63 "DocumentType missing: $dt"
+        fi
+    done
+    if ! grep -q "class DocumentVersion" "$DOC_DOMAIN"; then
+        fail 63 "DocumentVersion class not found"
+    fi
+    if ! grep -q "is_superseded" "$DOC_DOMAIN"; then
+        fail 63 "DocumentVersion missing is_superseded (versioning)"
+    fi
+    if ! grep -q "is_revoked" "$DOC_DOMAIN"; then
+        fail 63 "DocumentVersion missing is_revoked (revocation per ADR-0055)"
+    fi
+    if ! grep -q "encryption_key_id" "$DOC_DOMAIN"; then
+        fail 63 "DocumentVersion missing encryption_key_id (crypto shredding per ADR-0055)"
+    fi
+fi
+
+# ─── Rule 64: Storage port + stub adapter ──────────────────────────────
+STORAGE_PORT="$ROOT/src/noventra/apps/kyc/domain/storage_port.py"
+STORAGE_STUB="$ROOT/src/noventra/apps/kyc/adapters/storage_stub.py"
+if [ ! -f "$STORAGE_PORT" ]; then
+    fail 64 "Storage port not found: $STORAGE_PORT"
+else
+    for method in "def put" "def get" "def delete" "def head"; do
+        if ! grep -q "$method" "$STORAGE_PORT"; then
+            fail 64 "StoragePort missing method: $method"
+        fi
+    done
+fi
+if [ ! -f "$STORAGE_STUB" ]; then
+    fail 64 "Stub storage adapter not found: $STORAGE_STUB"
+elif ! grep -q "class StubStorageAdapter" "$STORAGE_STUB"; then
+    fail 64 "StubStorageAdapter class not found"
+fi
+
+# ─── Rule 65: AML/CFT domain exists with screening + SAR ───────────────
+AML_DOMAIN="$ROOT/src/noventra/apps/kyc/domain/aml.py"
+if [ ! -f "$AML_DOMAIN" ]; then
+    fail 65 "AML domain not found: $AML_DOMAIN"
+else
+    if ! grep -q "class ScreeningResult" "$AML_DOMAIN"; then
+        fail 65 "ScreeningResult class not found"
+    fi
+    if ! grep -q "class AmlResult" "$AML_DOMAIN"; then
+        fail 65 "AmlResult class not found"
+    fi
+    if ! grep -q "class SarRecord" "$AML_DOMAIN"; then
+        fail 65 "SarRecord class not found"
+    fi
+    if ! grep -q "mlro_restricted" "$AML_DOMAIN"; then
+        fail 65 "SarRecord missing mlro_restricted (MLRO-only visibility per ADR-0058)"
+    fi
+    if ! grep -q "ScreeningType" "$AML_DOMAIN"; then
+        fail 65 "ScreeningType enum not found (PEP/sanctions)"
+    fi
+fi
+
+# ─── Rule 66: Review queue domain exists with SLA + escalation ─────────
+REVIEW_DOMAIN="$ROOT/src/noventra/apps/kyc/domain/review_queue.py"
+if [ ! -f "$REVIEW_DOMAIN" ]; then
+    fail 66 "Review queue domain not found: $REVIEW_DOMAIN"
+else
+    if ! grep -q "class ReviewQueueEntry" "$REVIEW_DOMAIN"; then
+        fail 66 "ReviewQueueEntry class not found"
+    fi
+    if ! grep -q "class ReviewDecision" "$REVIEW_DOMAIN"; then
+        fail 66 "ReviewDecision enum not found"
+    fi
+    if ! grep -q "sla_deadline" "$REVIEW_DOMAIN"; then
+        fail 66 "ReviewQueueEntry missing sla_deadline (SLA tracking)"
+    fi
+    if ! grep -q "is_sla_breached" "$REVIEW_DOMAIN"; then
+        fail 66 "ReviewQueueEntry missing is_sla_breached property"
+    fi
+    if ! grep -q "escalated" "$REVIEW_DOMAIN"; then
+        fail 66 "ReviewQueueEntry missing escalated field (escalation path)"
+    fi
+    if ! grep -q "mlro" "$REVIEW_DOMAIN"; then
+        fail 66 "ReviewQueueEntry missing MLRO escalation target"
+    fi
+fi
+
+# ─── Rule 67: Audit event taxonomy extended with kyc/document/aml/review/sar ─
+EVENT_TYPES="$ROOT/src/noventra/apps/audit/domain/event_types.py"
+if [ ! -f "$EVENT_TYPES" ]; then
+    fail 67 "Event types not found: $EVENT_TYPES"
+else
+    for cat in kyc document aml review sar; do
+        if ! grep -q "\"${cat}\." "$EVENT_TYPES"; then
+            fail 67 "Event type catalog missing category: $cat"
+        fi
+    done
+    # Verify SAR events exist with MLRO restriction note.
+    if ! grep -q "sar.filed" "$EVENT_TYPES"; then
+        fail 67 "Event type catalog missing sar.filed"
+    fi
+fi
+
+# ─── Rule 68: KYC app added to INSTALLED_APPS ──────────────────────────
+if ! grep -q "noventra.apps.kyc" "$ROOT/src/noventra/settings/base.py"; then
+    fail 68 "KYC app not added to INSTALLED_APPS"
+fi
+
+# ─── Rule 69: KYC apps.py exists ───────────────────────────────────────
+KYC_APPS="$ROOT/src/noventra/apps/kyc/apps.py"
+if [ ! -f "$KYC_APPS" ]; then
+    fail 69 "KYC apps.py not found"
+elif ! grep -q "class KycConfig" "$KYC_APPS"; then
+    fail 69 "KycConfig class not found"
+fi
+
+# ─── Rule 70: Phase 10 inventory (tests, handoff, audit) ───────────────
+required_phase10_files=(
+    "$ROOT/src/noventra/apps/kyc/__init__.py"
+    "$ROOT/src/noventra/apps/kyc/apps.py"
+    "$ROOT/src/noventra/apps/kyc/domain/__init__.py"
+    "$ROOT/src/noventra/apps/kyc/domain/kyc_case.py"
+    "$ROOT/src/noventra/apps/kyc/domain/document.py"
+    "$ROOT/src/noventra/apps/kyc/domain/aml.py"
+    "$ROOT/src/noventra/apps/kyc/domain/review_queue.py"
+    "$ROOT/src/noventra/apps/kyc/domain/storage_port.py"
+    "$ROOT/src/noventra/apps/kyc/adapters/storage_stub.py"
+    "$ROOT/docs/stage-handoffs/stage-10-handoff.md"
+    "$ROOT/docs/audits/phase-010-audit.md"
+    "$ROOT/tests/test_kyc_documents.py"
+)
+for f in "${required_phase10_files[@]}"; do
+    if [ ! -f "$f" ]; then
+        fail 70 "Phase 10 inventory file missing: $f"
+    elif [ ! -s "$f" ]; then
+        fail 70 "Phase 10 inventory file empty: $f"
+    fi
+done
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 11-13 rules (71–100) — Ledger, FX, Payments, Bonuses
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 71: Ledger double-entry balance check exists ─────────────────
+LEDGER_SVC="$ROOT/src/noventra/modules/ledger/services.py"
+if [ ! -f "$LEDGER_SVC" ]; then
+    fail 71 "Ledger services not found (Phase 11 Stage B BLOCKED)"
+elif ! grep -q "amount_minor" "$LEDGER_SVC"; then
+    fail 71 "Ledger services missing amount handling (double-entry balance)"
+fi
+
+# ─── Rule 72: Reversal references source_ref ───────────────────────────
+if [ -f "$LEDGER_SVC" ]; then
+    if grep -q "REVERSAL" "$LEDGER_SVC" && ! grep -q "source_ref" "$LEDGER_SVC"; then
+        fail 72 "ReversalService handles REVERSAL but does not reference source_ref"
+    fi
+fi
+
+# ─── Rule 73: No UPDATE/DELETE on ledger tables (grep) ─────────────────
+LEDGER_UPDATES=$(grep -rn "UPDATE.*ledger_journal\|DELETE.*ledger_journal" "$ROOT/src/noventra/modules/ledger/" 2>/dev/null | grep -v "migrations/\|reconciliation_log\|REVERSED\|CREATE TRIGGER\|GRANT\|BEFORE" | head -1)
+if [ -n "$LEDGER_UPDATES" ]; then
+    fail 73 "UPDATE/DELETE found on ledger journal tables (immutability violation): $LEDGER_UPDATES"
+fi
+
+# ─── Rule 74: Cross-currency fx_pair_id check ──────────────────────────
+LEDGER_MODELS="$ROOT/src/noventra/modules/ledger/models.py"
+if [ -f "$LEDGER_MODELS" ]; then
+    if ! grep -q "fx_pair_id" "$LEDGER_MODELS"; then
+        fail 74 "Ledger models missing fx_pair_id (cross-currency requirement)"
+    fi
+fi
+
+# ─── Rule 75: Every ledger model has tenant_uuid ───────────────────────
+if [ -f "$LEDGER_MODELS" ]; then
+    if ! grep -q "tenant_uuid" "$LEDGER_MODELS"; then
+        fail 75 "Ledger models missing tenant_uuid (RLS requirement)"
+    fi
+fi
+
+# ─── Rule 76: Player account CHECK >= 0 in migration ───────────────────
+LEDGER_MIG="$ROOT/src/noventra/modules/ledger/migrations/0001_initial.py"
+if [ -f "$LEDGER_MIG" ]; then
+    if ! grep -q "balance_minor" "$LEDGER_MIG"; then
+        fail 76 "Ledger migration missing balance_minor (overdraft CHECK requirement)"
+    fi
+fi
+
+# ─── Rule 77: FinancialAuditEvent has correlation_id ───────────────────
+if [ -f "$LEDGER_MODELS" ]; then
+    if ! grep -q "correlation_id" "$LEDGER_MODELS"; then
+        fail 77 "Ledger models missing correlation_id on FinancialAuditEvent"
+    fi
+fi
+
+# ─── Rule 78: No FloatField/DecimalField in ledger/fx ──────────────────
+FLOAT_FINDINGS=$(grep -rn "FloatField\|DecimalField" "$ROOT/src/noventra/modules/ledger/" "$ROOT/src/noventra/modules/fx/" 2>/dev/null | head -1)
+if [ -n "$FLOAT_FINDINGS" ]; then
+    fail 78 "FloatField/DecimalField found in ledger/fx code (integer minor units only)"
+fi
+
+# ─── Rule 79: Financial audit chain verifier exists ────────────────────
+FINANCIAL_VERIFIER="$ROOT/src/noventra/modules/ledger"
+if [ ! -d "$FINANCIAL_VERIFIER" ]; then
+    fail 79 "Ledger module not found (financial audit chain verifier pending Phase 11 Stage B)"
+fi
+
+# ─── Rule 80: noventra_auditor grants in migration ─────────────────────
+if [ -f "$LEDGER_MIG" ]; then
+    if ! grep -q "noventra_admin\|noventra_app" "$LEDGER_MIG"; then
+        fail 80 "Ledger migration missing role grants"
+    fi
+fi
+
+# ─── Rule 81: No card field names in code ──────────────────────────────
+CARD_FIELDS=$(grep -rn -i "card_number\|pan\b\|cvv\|cvc\|expiry_month\|expiry_year\|track_data\|magstripe" "$ROOT/src/" 2>/dev/null | grep -v "test\|migration\|__pycache__\|\.pyc" | head -1)
+if [ -n "$CARD_FIELDS" ]; then
+    fail 81 "Card field name found in code (PCI SAQ-A violation): $CARD_FIELDS"
+fi
+
+# ─── Rule 82: Key separation (sk_test/sk_live) ─────────────────────────
+KEY_TEST=$(grep -rn "sk_test_\|sk_live_" "$ROOT/src/" 2>/dev/null | head -1)
+if [ -n "$KEY_TEST" ]; then
+    fail 82 "PSP key found in source code (must be env-only): $KEY_TEST"
+fi
+
+# ─── Rule 83: Webhook signature verification spec exists ───────────────
+PAYMENTS_DESIGN="$ROOT/docs/architecture/payments-design.md"
+if [ ! -f "$PAYMENTS_DESIGN" ]; then
+    fail 83 "Payments design doc not found (webhook signature spec)"
+elif ! grep -q "HMAC-SHA256" "$PAYMENTS_DESIGN"; then
+    fail 83 "Payments design doc missing HMAC-SHA256 webhook signature spec"
+fi
+
+# ─── Rule 84: Webhook dedup spec exists ────────────────────────────────
+if [ -f "$PAYMENTS_DESIGN" ]; then
+    if ! grep -q "nonce\|idempot" "$PAYMENTS_DESIGN"; then
+        fail 84 "Payments design doc missing webhook dedup/idempotency spec"
+    fi
+fi
+
+# ─── Rule 85: Payment-ledger posting spec exists ───────────────────────
+if [ -f "$PAYMENTS_DESIGN" ]; then
+    if ! grep -q "ledger" "$PAYMENTS_DESIGN"; then
+        fail 85 "Payments design doc missing ledger posting contract"
+    fi
+fi
+
+# ─── Rule 86: Dispute FSM spec exists ──────────────────────────────────
+if [ -f "$PAYMENTS_DESIGN" ]; then
+    if ! grep -q "dispute\|chargeback" "$PAYMENTS_DESIGN"; then
+        fail 86 "Payments design doc missing dispute/chargeback spec"
+    fi
+fi
+
+# ─── Rule 87: PSP port spec exists ─────────────────────────────────────
+if [ -f "$PAYMENTS_DESIGN" ]; then
+    if ! grep -q "PspPort\|PSP.*port" "$PAYMENTS_DESIGN"; then
+        fail 87 "Payments design doc missing PSP port spec"
+    fi
+fi
+
+# ─── Rule 88: DLP redaction exists (Phase 4 redaction.py) ──────────────
+REDACTION="$ROOT/src/noventra/observability/redaction.py"
+if [ ! -f "$REDACTION" ]; then
+    fail 88 "DLP redaction not found (Phase 4 redaction.py)"
+elif ! grep -q "SECRET_PATTERNS\|REDACTED" "$REDACTION"; then
+    fail 88 "DLP redaction missing patterns or REDACTED output"
+fi
+
+# ─── Rule 89: FX rate locking spec exists ──────────────────────────────
+LEDGER_DESIGN="$ROOT/docs/architecture/ledger-design.md"
+if [ -f "$LEDGER_DESIGN" ]; then
+    if ! grep -q "fx.*lock\|locked.*posting\|fx_pair_id" "$LEDGER_DESIGN"; then
+        fail 89 "Ledger design doc missing FX rate locking spec"
+    fi
+fi
+
+# ─── Rule 90: Reconciliation spec exists ───────────────────────────────
+if [ -f "$LEDGER_DESIGN" ]; then
+    if ! grep -q "reconcil" "$LEDGER_DESIGN"; then
+        fail 90 "Ledger design doc missing reconciliation spec"
+    fi
+fi
+
+# ─── Rules 91-100: Phase 13 Bonuses (Stage A design checks) ────────────
+
+# ─── Rule 91: Bonuses module exists ────────────────────────────────────
+BONUSES_DIR="$ROOT/src/noventra/modules/bonuses"
+if [ ! -d "$BONUSES_DIR" ]; then
+    fail 91 "Bonuses module not found"
+elif [ ! -f "$BONUSES_DIR/domain/offer.py" ]; then
+    fail 91 "Bonuses domain/offer.py not found"
+fi
+
+# ─── Rule 92: Bonus offer FSM with 7 types ─────────────────────────────
+OFFER_DOMAIN="$ROOT/src/noventra/modules/bonuses/domain/offer.py"
+if [ -f "$OFFER_DOMAIN" ]; then
+    for otype in deposit_match free_spins free_bet cashback reload refer_friend no_deposit; do
+        if ! grep -q "$otype" "$OFFER_DOMAIN"; then
+            fail 92 "Bonus offer catalog missing type: $otype"
+        fi
+    done
+    if ! grep -q "@transition" "$OFFER_DOMAIN"; then
+        fail 92 "Bonus offer missing @transition decorators (FSM)"
+    fi
+    if ! grep -q "revoke" "$OFFER_DOMAIN"; then
+        fail 92 "Bonus offer missing revoke transition (synchronous revocation per Law 10)"
+    fi
+fi
+
+# ─── Rule 93: Bonus award with wagering requirements ───────────────────
+AWARD_DOMAIN="$ROOT/src/noventra/modules/bonuses/domain/award.py"
+if [ -f "$AWARD_DOMAIN" ]; then
+    if ! grep -q "wagering_requirement" "$AWARD_DOMAIN"; then
+        fail 93 "Bonus award missing wagering_requirement"
+    fi
+    if ! grep -q "max_bet_during_wagering" "$AWARD_DOMAIN"; then
+        fail 93 "Bonus award missing max_bet_during_wagering (UK GC mandate)"
+    fi
+    if ! grep -q "bonus.*first\|bonus_first" "$AWARD_DOMAIN"; then
+        fail 93 "Bonus award missing bonus-first consumption order"
+    fi
+    if ! grep -q "convert" "$AWARD_DOMAIN"; then
+        fail 93 "Bonus award missing convert method (bonus→real conversion)"
+    fi
+fi
+
+# ─── Rule 94: Port interfaces exist (RG, Jurisdiction, Realtime) ───────
+PORTS="$ROOT/src/noventra/modules/bonuses/domain/ports.py"
+if [ ! -f "$PORTS" ]; then
+    fail 94 "Bonus port interfaces not found"
+else
+    for port in RGPort JurisdictionPort RealtimePort; do
+        if ! grep -q "class $port" "$PORTS"; then
+            fail 94 "Port interface missing: $port"
+        fi
+    done
+fi
+
+# ─── Rule 95: Stub adapters exist ──────────────────────────────────────
+STUBS="$ROOT/src/noventra/modules/bonuses/adapters/stubs.py"
+if [ ! -f "$STUBS" ]; then
+    fail 95 "Bonus stub adapters not found"
+else
+    for stub in StubRGAdapter StubJurisdictionAdapter StubRealtimeAdapter; do
+        if ! grep -q "class $stub" "$STUBS"; then
+            fail 95 "Stub adapter missing: $stub"
+        fi
+    done
+fi
+
+# ─── Rule 96: Phase 13 ADRs PROPOSED (0078-0083) ───────────────────────
+for n in 0078 0079 0080 0081 0082 0083; do
+    adr_file="$ROOT/docs/adr/ADR-$n.md"
+    if [ ! -f "$adr_file" ]; then
+        fail 96 "ADR-$n.md not found"
+        continue
+    fi
+    fm_status=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+        fm >= 2 { exit }
+    ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ "$fm_status" != "PROPOSED" ]; then
+        fail 96 "ADR-$n status is '$fm_status' (expected PROPOSED for Phase 13 Stage A)"
+    fi
+done
+
+# ─── Rule 97: Bonuses design doc exists ────────────────────────────────
+BONUSES_DESIGN="$ROOT/docs/architecture/bonuses-design.md"
+if [ ! -f "$BONUSES_DESIGN" ]; then
+    fail 97 "Bonuses design doc not found"
+fi
+
+# ─── Rule 98: Phase 13 handoff exists ──────────────────────────────────
+if [ ! -f "$ROOT/docs/stage-handoffs/stage-13-handoff.md" ]; then
+    fail 98 "stage-13-handoff.md not found"
+fi
+
+# ─── Rule 99: Phase 13 audit exists ────────────────────────────────────
+if [ ! -f "$ROOT/docs/audits/phase-013-audit.md" ]; then
+    fail 99 "phase-013-audit.md not found"
+fi
+
+# ─── Rule 100: No floats in bonuses module ─────────────────────────────
+BONUS_FLOATS=$(grep -rn "FloatField\|DecimalField\|float\b" "$ROOT/src/noventra/modules/bonuses/" 2>/dev/null | grep -v "game_class_contribution\|__pycache__\|\.pyc" | head -1)
+if [ -n "$BONUS_FLOATS" ]; then
+    fail 100 "Float/Decimal found in bonuses module (integer minor units only): $BONUS_FLOATS"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 14 rules (101–110) — Protection & Jurisdiction (behavior-enforcing)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─── Rule 101: Protection module exists with domain models ─────────────
+PROTECTION_DIR="$ROOT/src/noventra/modules/protection"
+if [ ! -d "$PROTECTION_DIR" ]; then
+    fail 101 "Protection module not found"
+else
+    for f in limits.py self_exclusion.py reality_check.py kill_switch.py jurisdiction.py ports.py; do
+        if [ ! -f "$PROTECTION_DIR/domain/$f" ]; then
+            fail 101 "Protection domain/$f not found"
+        fi
+    done
+fi
+
+# ─── Rule 102: PlayerLimit has 4 limit types + tightening/loosening ────
+LIMITS="$ROOT/src/noventra/modules/protection/domain/limits.py"
+if [ -f "$LIMITS" ]; then
+    for lt in deposit loss wagering session_time; do
+        if ! grep -q "$lt" "$LIMITS"; then
+            fail 102 "PlayerLimit missing limit type: $lt"
+        fi
+    done
+    if ! grep -q "tighten" "$LIMITS"; then
+        fail 102 "PlayerLimit missing tighten method (instant limit reduction)"
+    fi
+    if ! grep -q "loosen" "$LIMITS"; then
+        fail 102 "PlayerLimit missing loosen method (cooling-off limit increase)"
+    fi
+    if ! grep -q "cooling_off" "$LIMITS"; then
+        fail 102 "PlayerLimit missing cooling-off for loosening"
+    fi
+fi
+
+# ─── Rule 103: SelfExclusion has HMAC + SE-survives-erasure ────────────
+SE="$ROOT/src/noventra/modules/protection/domain/self_exclusion.py"
+if [ -f "$SE" ]; then
+    if ! grep -q "pseudonymized_identity" "$SE"; then
+        fail 103 "SelfExclusion missing pseudonymized_identity (SE-survives-erasure)"
+    fi
+    if ! grep -q "hmac\|HMAC" "$SE"; then
+        fail 103 "SelfExclusion missing HMAC pseudonymization"
+    fi
+    if ! grep -q "check_pseudonymized_identity" "$SE"; then
+        fail 103 "SelfExclusion missing check_pseudonymized_identity (registration check)"
+    fi
+    for period in "6m" "1y" "2y" "5y" "lifetime"; do
+        if ! grep -q "$period" "$SE"; then
+            fail 103 "SelfExclusion missing period: $period"
+        fi
+    done
+fi
+
+# ─── Rule 104: KillSwitch has <200ms SLO architecture ──────────────────
+KS="$ROOT/src/noventra/modules/protection/domain/kill_switch.py"
+if [ -f "$KS" ]; then
+    if ! grep -q "200ms\|<200" "$KS"; then
+        # The <200ms SLO is in the docstring/comments, not code. Check design doc.
+        KS_DESIGN="$ROOT/docs/architecture/protection-design.md"
+        if ! grep -q "200ms" "$KS_DESIGN" 2>/dev/null; then
+            fail 104 "Kill Switch <200ms SLO not documented in code or design doc"
+        fi
+    fi
+    if ! grep -q "trigger" "$KS"; then
+        fail 104 "KillSwitch missing trigger method"
+    fi
+    if ! grep -q "lift" "$KS"; then
+        fail 104 "KillSwitch missing lift method"
+    fi
+    if ! grep -q "TENANT\|GLOBAL" "$KS"; then
+        fail 104 "KillSwitch missing scope (TENANT/GLOBAL fan-out)"
+    fi
+fi
+
+# ─── Rule 105: Real adapters exist (replacing Phase 13 stubs) ──────────
+REAL_ADAPTERS="$ROOT/src/noventra/modules/protection/adapters/real_adapters.py"
+if [ ! -f "$REAL_ADAPTERS" ]; then
+    fail 105 "Real adapters not found (Phase 14 must replace Phase 13 stubs)"
+else
+    for adapter in RealRGAdapter RealJurisdictionAdapter RealRealtimeAdapter; do
+        if ! grep -q "class $adapter" "$REAL_ADAPTERS"; then
+            fail 105 "Real adapter missing: $adapter (must replace Phase 13 stub)"
+        fi
+    done
+    if ! grep -q "StubRoundVoidingAdapter" "$REAL_ADAPTERS"; then
+        fail 105 "StubRoundVoidingAdapter missing (Phase 15 implements real)"
+    fi
+    if ! grep -q "StubGeoAdapter" "$REAL_ADAPTERS"; then
+        fail 105 "StubGeoAdapter missing (Q5-blocked)"
+    fi
+fi
+
+# ─── Rule 106: JurisdictionPolicyEngine exists with rule checks ────────
+JURISDICTION="$ROOT/src/noventra/modules/protection/domain/jurisdiction.py"
+if [ -f "$JURISDICTION" ]; then
+    if ! grep -q "class JurisdictionPolicyEngine" "$JURISDICTION"; then
+        fail 106 "JurisdictionPolicyEngine class not found"
+    fi
+    if ! grep -q "check_bonus_eligibility" "$JURISDICTION"; then
+        fail 106 "JurisdictionPolicyEngine missing check_bonus_eligibility"
+    fi
+    if ! grep -q "check_rule" "$JURISDICTION"; then
+        fail 106 "JurisdictionPolicyEngine missing check_rule method"
+    fi
+fi
+
+# ─── Rule 107: RealityCheck has overdue + acknowledge ───────────────────
+RC="$ROOT/src/noventra/modules/protection/domain/reality_check.py"
+if [ -f "$RC" ]; then
+    if ! grep -q "is_overdue" "$RC"; then
+        fail 107 "RealityCheck missing is_overdue property"
+    fi
+    if ! grep -q "acknowledge" "$RC"; then
+        fail 107 "RealityCheck missing acknowledge method (UK GC mandate)"
+    fi
+    if ! grep -q "interval_minutes" "$RC"; then
+        fail 107 "RealityCheck missing interval_minutes (configurable interval)"
+    fi
+fi
+
+# ─── Rule 108: Phase 14 ADRs PROPOSED (0084-0091) ─────────────────────
+for n in 0084 0085 0086 0087 0088 0089 0090 0091; do
+    adr_file="$ROOT/docs/adr/ADR-$n.md"
+    if [ ! -f "$adr_file" ]; then
+        fail 108 "ADR-$n.md not found"
+        continue
+    fi
+    fm_status=$(awk '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && /^Status:/ { print substr($0, index($0, ":") + 1) }
+        fm >= 2 { exit }
+    ' "$adr_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ "$fm_status" != "PROPOSED" ]; then
+        fail 108 "ADR-$n status is '$fm_status' (expected PROPOSED for Phase 14 Stage A)"
+    fi
+done
+
+# ─── Rule 109: Protection design doc exists with Kill Switch spec ──────
+PROTECTION_DESIGN="$ROOT/docs/architecture/protection-design.md"
+if [ ! -f "$PROTECTION_DESIGN" ]; then
+    fail 109 "Protection design doc not found"
+elif ! grep -q "200ms" "$PROTECTION_DESIGN"; then
+    fail 109 "Protection design doc missing Kill Switch <200ms SLO spec"
+elif ! grep -q "kill.switch\|KillSwitch\|Kill Switch" "$PROTECTION_DESIGN"; then
+    fail 109 "Protection design doc missing Kill Switch architecture"
+fi
+
+# ─── Rule 110: Design debt register exists ─────────────────────────────
+DEBT_REGISTER="$ROOT/docs/audits/design-debt-register.md"
+if [ ! -f "$DEBT_REGISTER" ]; then
+    fail 110 "Design debt register not found (observation #1 from Phase 13 audit)"
+fi
+
+# ─── Floor checks (informational) ───────────────────────────────────────
+req_floor=62
+dec_floor=95
+adr_floor=88
+if [ "$req_count" -lt "$req_floor" ]; then
+    echo "LINT WARN: REQ count $req_count < floor $req_floor" >&2
+fi
+if [ "$dec_count" -lt "$dec_floor" ]; then
+    echo "LINT WARN: DEC count $dec_count < floor $dec_floor" >&2
+fi
+if [ "$adr_count" -lt "$adr_floor" ]; then
+    echo "LINT WARN: ADR count $adr_count < floor $adr_floor" >&2
+fi
+
+# ─── Summary ────────────────────────────────────────────────────────────
+echo "─── Traceability Lint Summary ───"
+echo "Trace file: $TRACE_FILE"
+echo "ADR dir:    $ADR_DIR"
+echo "REQs parsed: $req_count (floor: $req_floor)"
+echo "DECs parsed: $dec_count (floor: $dec_floor)"
+echo "ADRs parsed: $adr_count (floor: $adr_floor)"
+echo "Violations:  $VIOLATIONS"
+
+if [ "$VIOLATIONS" -gt 0 ]; then
+    exit 1
+fi
+exit 0

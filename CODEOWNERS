@@ -1,0 +1,66 @@
+# CODEOWNERS — Per ADR-0022 / Phase 3 spec hard acceptance.
+# References the roles doc (docs/requirements/roles.md) for owner titles.
+# GitHub CODEOWNERS syntax: <path pattern> @user/team
+# In Phase 3 (no GitHub org yet), we use role-name pseudo-teams that
+# map to the roles in docs/requirements/roles.md §1.
+
+# ─── Default: all files require Architecture Lead review ────────────────
+*                                       @architecture-lead
+
+# ─── Blueprint + governance (Architecture Lead) ────────────────────────
+docs/BLUEPRINT.md                       @architecture-lead @engineering-lead
+docs/ERRATA-v5.2.1.md                   @architecture-lead @engineering-lead
+docs/errata/                            @architecture-lead @engineering-lead
+docs/requirements/traceability.md       @architecture-lead @engineering-lead
+docs/requirements/scope.md              @architecture-lead
+docs/requirements/domain-boundaries.md  @architecture-lead
+docs/requirements/nfr.md                @architecture-lead @infrastructure-lead
+docs/requirements/roles.md              @engineering-lead
+docs/requirements/workflows.md          @architecture-lead @compliance-lead
+docs/requirements/triage-table.md       @architecture-lead @engineering-lead
+docs/requirements/stage-*-handoff.md    @architecture-lead @engineering-lead
+docs/requirements/unresolved-decisions.md @engineering-lead
+
+# ─── ADRs (Architecture Lead) ───────────────────────────────────────────
+docs/adr/                               @architecture-lead
+
+# ─── Architecture files ────────────────────────────────────────────────
+docs/architecture/security.md           @security-lead
+docs/architecture/nfr-allocation.md     @architecture-lead @infrastructure-lead
+docs/architecture/capacity-assumptions.md @infrastructure-lead
+docs/architecture/data-classification.md @data-protection-officer
+docs/architecture/risk-register.md      @architecture-lead @engineering-lead
+docs/architecture/settings-split.md     @architecture-lead @security-lead
+
+# ─── Phase 0 evidence (Compliance + Commercial) ────────────────────────
+docs/phase-0-evidence.md                @compliance-lead @commercial-lead
+
+# ─── Audits (Engineering Lead) ─────────────────────────────────────────
+docs/audits/                            @engineering-lead
+
+# ─── Source code ───────────────────────────────────────────────────────
+src/noventra/settings/                  @architecture-lead @security-lead
+src/noventra/api/                       @architecture-lead
+src/noventra/apps/core/                 @architecture-lead
+src/noventra/apps/tenancy/              @architecture-lead
+src/noventra/apps/identity/             @identity-lead
+src/noventra/apps/audit/                @architecture-lead @compliance-lead
+src/noventra/apps/config/               @infrastructure-lead
+src/noventra/apps/flags/                @architecture-lead
+src/noventra/apps/telemetry/            @infrastructure-lead
+src/noventra/apps/reliability/          @architecture-lead
+src/noventra/apps/backups/              @operations-lead
+src/noventra/apps/webhooks/             @infrastructure-lead
+
+# ─── Deploy + infra ────────────────────────────────────────────────────
+deploy/                                 @infrastructure-lead
+Dockerfile                              @infrastructure-lead
+docker-compose.yml                      @infrastructure-lead
+
+# ─── CI + scripts ──────────────────────────────────────────────────────
+.github/workflows/                      @engineering-lead
+scripts/check_traceability.sh           @architecture-lead @engineering-lead
+scripts/                                @engineering-lead
+
+# ─── Tests ─────────────────────────────────────────────────────────────
+tests/                                  @engineering-lead

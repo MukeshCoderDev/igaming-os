@@ -1,0 +1,99 @@
+# docker-compose.yml — Noventra dev environment (Phase 5).
+# Per ADR-0022 / DEC-0027:
+# - Postgres 16 (pinned major per stage-02-handoff.md §3.2).
+# - pgbouncer (Phase 5 / ADR-0030) in transaction-mode.
+# - Redis 7 (pinned major).
+# - Healthchecks on all; app depends_on healthy.
+# - Init SQL scripts mounted to /docker-entrypoint-initdb.d/.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: noventra-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-noventra}
+      POSTGRES_USER: ${POSTGRES_USER:-noventra_dev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-noventra_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/docker/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-noventra_dev} -d ${POSTGRES_DB:-noventra}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: noventra-pgbouncer
+    environment:
+      DB_USER: ${POSTGRES_USER:-noventra_dev}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-noventra_dev_password}
+      DB_HOST: postgres
+      DB_NAME: ${POSTGRES_DB:-noventra}
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 20
+      ADMIN_USERS: ${POSTGRES_USER:-noventra_dev}
+    ports:
+      - "${PGBOUNCER_PORT:-6432}:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U ${POSTGRES_USER:-noventra_dev}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: noventra-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  app:
+    build: .
+    container_name: noventra-app
+    environment:
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-noventra.settings.local}
+      SECRET_KEY: ${SECRET_KEY:-dev-insecure-secret-key-change-me}
+      # Phase 5: app connects via pgbouncer (port 6432) instead of
+      # directly to Postgres (port 5432). Per ADR-0030.
+      DATABASE_URL: postgres://${POSTGRES_USER:-noventra_dev}:${POSTGRES_PASSWORD:-noventra_dev_password}@pgbouncer:5432/${POSTGRES_DB:-noventra}
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: ${DEBUG:-true}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-*}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src:ro
+      - ./manage.py:/app/manage.py:ro
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py runserver 0.0.0.0:8000"
+    profiles: ["app"]
+
+volumes:
+  postgres_data:
+  redis_data:
