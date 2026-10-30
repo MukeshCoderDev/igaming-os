@@ -154,6 +154,12 @@ class Migration(migrations.Migration):
             ],
             reverse_sql=[],
         ),
+        migrations.RunSQL(
+            sql=[
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON tenancy_tenant, tenancy_brand TO noventra_app, noventra_worker;",
+            ],
+            reverse_sql=[],
+        ),
         # ── Baseline dev data (2 tenants + 2 brands) ─────────────────
         # Only loaded in dev/test. Production seeds via provisioning API.
         # UUIDs are fixed for deterministic tests.

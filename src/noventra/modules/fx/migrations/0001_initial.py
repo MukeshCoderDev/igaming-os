@@ -3,7 +3,7 @@ from django.db import migrations
 
 class Migration(migrations.Migration):
     initial = True
-    dependencies = []
+    dependencies = [("ledger", "0001_initial")]
     operations = [
         migrations.RunSQL(sql=[
             "CREATE TABLE fx_rate_snapshot (snapshot_uuid UUID PRIMARY KEY, tenant_uuid UUID, source VARCHAR(20) NOT NULL, base_currency CHAR(3) NOT NULL, quote_currency CHAR(3) NOT NULL, rate_minor BIGINT NOT NULL, rate_exponent SMALLINT NOT NULL, bid_minor BIGINT, ask_minor BIGINT, captured_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW());",

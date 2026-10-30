@@ -149,8 +149,9 @@ class TestConsentImmutability:
             cursor.execute("SET LOCAL app.tenant_uuid = %s", [TENANT_A])
             cursor.execute(
                 """
-                INSERT INTO players_consent (consent_uuid, player_uuid, tenant_uuid, purpose, channel, status)
-                VALUES (%s, %s, %s, 'marketing.email', 'email', 'granted')
+                INSERT INTO players_consent
+                    (consent_uuid, player_uuid, tenant_uuid, purpose, channel, status, policy_version, created_at)
+                VALUES (%s, %s, %s, 'marketing.email', 'email', 'granted', 1, NOW())
                 """,
                 [consent_uuid, str(uuid.uuid4()), TENANT_A],
             )
@@ -169,8 +170,9 @@ class TestConsentImmutability:
             cursor.execute("SET LOCAL app.tenant_uuid = %s", [TENANT_A])
             cursor.execute(
                 """
-                INSERT INTO players_consent (consent_uuid, player_uuid, tenant_uuid, purpose, channel, status)
-                VALUES (%s, %s, %s, 'marketing.email', 'email', 'granted')
+                INSERT INTO players_consent
+                    (consent_uuid, player_uuid, tenant_uuid, purpose, channel, status, policy_version, created_at)
+                VALUES (%s, %s, %s, 'marketing.email', 'email', 'granted', 1, NOW())
                 """,
                 [consent_uuid, str(uuid.uuid4()), TENANT_A],
             )

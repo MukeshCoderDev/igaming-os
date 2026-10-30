@@ -105,20 +105,15 @@ class Migration(migrations.Migration):
                     END IF;
 
                     -- Lock the chain head row for this scope (pgbouncer-compatible: short transaction).
+                    INSERT INTO audit_chain_head (scope, last_event_uuid, last_hash)
+                    VALUES (v_scope, NULL, NULL)
+                    ON CONFLICT (scope) DO NOTHING;
+
                     SELECT * INTO v_chain_head
                         FROM audit_chain_head
                         WHERE scope = v_scope
                         FOR UPDATE;
-
-                    -- If no chain head exists for this scope, create one.
-                    IF v_chain_head.scope IS NULL THEN
-                        INSERT INTO audit_chain_head (scope, last_event_uuid, last_hash)
-                        VALUES (v_scope, NULL, NULL)
-                        ON CONFLICT (scope) DO NOTHING;
-                        v_prev_hash := NULL;
-                    ELSE
-                        v_prev_hash := v_chain_head.last_hash;
-                    END IF;
+                    v_prev_hash := v_chain_head.last_hash;
 
                     NEW.prev_hash := v_prev_hash;
 

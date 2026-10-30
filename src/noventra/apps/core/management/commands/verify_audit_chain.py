@@ -82,7 +82,8 @@ class Command(BaseCommand):
                     """
                     SELECT event_uuid, tenant_id, actor_id, actor_type, event_type,
                            target_type, target_id, payload, prev_hash, hash,
-                           correlation_id, created_at
+                           correlation_id, created_at,
+                           EXTRACT(EPOCH FROM created_at)::TEXT
                     FROM audit_event
                     WHERE tenant_id IS NULL
                     ORDER BY created_at ASC, event_uuid ASC
@@ -95,7 +96,8 @@ class Command(BaseCommand):
                     """
                     SELECT event_uuid, tenant_id, actor_id, actor_type, event_type,
                            target_type, target_id, payload, prev_hash, hash,
-                           correlation_id, created_at
+                           correlation_id, created_at,
+                           EXTRACT(EPOCH FROM created_at)::TEXT
                     FROM audit_event
                     WHERE tenant_id = %s
                     ORDER BY created_at ASC, event_uuid ASC
@@ -113,7 +115,7 @@ class Command(BaseCommand):
             for row in rows:
                 event_uuid, tenant_id, actor_id, actor_type, event_type, \
                     target_type, target_id, payload_raw, stored_prev_hash, stored_hash, \
-                    correlation_id, created_at = row
+                    correlation_id, created_at, created_at_epoch = row
 
                 # 1. Hash continuity: stored prev_hash must match previous event's hash.
                 if prev_hash is not None and stored_prev_hash != prev_hash:
@@ -137,7 +139,7 @@ class Command(BaseCommand):
                     event_type=event_type,
                     actor_id=str(actor_id),
                     tenant_id=str(tenant_id) if tenant_id else "",
-                    created_at_epoch=int(created_at.timestamp()),
+                    created_at_epoch=created_at_epoch,
                 )
                 if recomputed_hash != stored_hash:
                     issues.append(
@@ -172,7 +174,7 @@ class Command(BaseCommand):
         event_type: str,
         actor_id: str,
         tenant_id: str,
-        created_at_epoch: int,
+        created_at_epoch: str,
     ) -> str:
         """Recompute the chain hash. Matches the DB trigger logic."""
         # Merkle-style: hash each field, concatenate, hash again.

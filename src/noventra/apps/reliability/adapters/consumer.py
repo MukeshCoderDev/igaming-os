@@ -73,8 +73,8 @@ class ConsumerBase:
                 # Insert into inbox (same transaction as the side effect).
                 cursor.execute(
                     """
-                    INSERT INTO reliability_inbox (message_id, consumer_id, tenant_id, payload_hash)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO reliability_inbox (message_id, consumer_id, processed_at, tenant_id, payload_hash)
+                    VALUES (%s, %s, NOW(), %s, %s)
                     ON CONFLICT DO NOTHING
                     """,
                     [message_id, self.consumer_id, tenant_id, payload_hash],

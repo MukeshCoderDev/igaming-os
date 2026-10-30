@@ -170,9 +170,10 @@ class TestHashChain:
         # Verify all 5 have non-null hashes.
         with connection.cursor() as cursor:
             cursor.execute("SET LOCAL app.tenant_uuid = %s", [TENANT_A])
+            placeholders = ", ".join(["%s"] * len(uuids))
             cursor.execute(
-                "SELECT COUNT(*) FROM audit_event WHERE event_uuid IN %s AND hash IS NOT NULL",
-                [tuple(uuids)],
+                f"SELECT COUNT(*) FROM audit_event WHERE event_uuid IN ({placeholders}) AND hash IS NOT NULL",
+                uuids,
             )
             count = cursor.fetchone()[0]
         assert count == 5

@@ -112,6 +112,7 @@ class TestWebhookService:
         )
         assert result["status"] == 400
 
+    @pytest.mark.django_db
     def test_webhook_unknown_event_type(self):
         """Unknown event type → 200 + warning."""
         psp = SandboxPspAdapter()

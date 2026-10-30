@@ -15,7 +15,7 @@ SAQ-A (self-assessment) to SAQ-D (full audit, potentially business-ending).
 """
 
 import re
-import subprocess
+from pathlib import Path
 from io import StringIO
 
 import pytest
@@ -29,6 +29,17 @@ TEST_PANS = [
     "3530111333300000",  # JCB
     "6200000000000005",  # UnionPay
 ]
+
+
+def source_matches(pattern: str) -> list[str]:
+    """Return matching Python source lines with stable file and line numbers."""
+    expression = re.compile(pattern, re.IGNORECASE)
+    findings = []
+    for path in sorted(Path("src").rglob("*.py")):
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if expression.search(line):
+                findings.append(f"{path.as_posix()}:{line_number}:{line}")
+    return findings
 
 
 def luhn_valid(card_number: str) -> bool:
@@ -110,19 +121,15 @@ class TestPCIDLPInjection:
 
     def test_no_pan_field_names_in_src(self):
         """Verify no PAN field names in src/ code."""
-        result = subprocess.run(
-            ["grep", "-rn", "-E",
-             "card_number|pan|cvv|cvc|expiry_month|expiry_year|track_data|magstripe",
-             "src/"],
-            capture_output=True, text=True
+        matches = source_matches(
+            r"card_number|pan|cvv|cvc|expiry_month|expiry_year|track_data|magstripe"
         )
         # Filter out false positives (comments, docstrings, PCI references).
         real_findings = []
-        for line in result.stdout.split("\n"):
+        for line in matches:
             if not line:
                 continue
-            # Allow: comments mentioning PCI, docstrings, __pycache__
-            if "PCI" in line or "__pycache__" in line or ".pyc" in line:
+            if "PCI" in line:
                 continue
             # Allow: the word "pan" in non-card contexts (e.g., "panel", "panda", "expansion")
             parts = line.split(":", 2)
@@ -142,13 +149,9 @@ class TestPCIDLPInjection:
 
     def test_no_psp_keys_in_src(self):
         """Verify no PSP keys (sk_test_/sk_live_) in source code."""
-        result = subprocess.run(
-            ["grep", "-rn", "-E", "sk_test_|sk_live_", "src/"],
-            capture_output=True, text=True
-        )
         real_findings = [
-            line for line in result.stdout.split("\n")
-            if line and "__pycache__" not in line and ".pyc" not in line
+            line for line in source_matches(r"sk_test_|sk_live_")
+            if line
             and "PCI" not in line and "#" not in line.split(":", 2)[-1][:10]
         ]
         assert len(real_findings) == 0, f"PSP keys found in source:\n{chr(10).join(real_findings)}"

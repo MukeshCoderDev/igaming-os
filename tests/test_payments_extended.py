@@ -93,27 +93,14 @@ class TestWebhookSignatureForgery:
         psp = SandboxPspAdapter()
         service = WebhookService(psp, webhook_secret=WEBHOOK_SECRET)
         payload = _webhook_event(event_id="evt_correct_1")
-        result = service.handle_webhook(
-            psp_name="stripe",
-            payload=payload,
-            signature=_hmac(payload),
-            tenant_uuid=TENANT_A,
-        )
-        # Signature passes; downstream may still fail on DB, but signature gate passes.
-        assert result["status"] in (200, 500)  # 500 = DB unavailable in unit test
+        assert service._verify_signature(payload, _hmac(payload), "stripe")
 
     def test_no_secret_falls_back_to_psp_port(self):
         """When no webhook secret configured, fall back to PSP port's verify_webhook."""
         psp = SandboxPspAdapter()  # verify_webhook always True in sandbox
         service = WebhookService(psp, webhook_secret="")
         payload = _webhook_event(event_id="evt_fallback_1")
-        result = service.handle_webhook(
-            psp_name="stripe",
-            payload=payload,
-            signature="any",
-            tenant_uuid=TENANT_A,
-        )
-        assert result["status"] in (200, 500)
+        assert service._verify_signature(payload, "any", "stripe")
 
     def test_timing_safe_comparison_used(self):
         """WebhookService uses hmac.compare_digest (constant-time). Verified by source inspection."""

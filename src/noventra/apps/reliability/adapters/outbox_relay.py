@@ -42,8 +42,9 @@ def append_to_outbox(
             """
             INSERT INTO reliability_outbox
                 (event_id, tenant_id, event_type, event_version, aggregate_id,
-                 aggregate_type, actor_id, correlation_id, payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 aggregate_type, actor_id, correlation_id, occurred_at, payload,
+                 status, retry_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, 'pending', 0)
             """,
             [
                 event_id, tenant_id, event_type, event_version,

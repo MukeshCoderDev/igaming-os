@@ -89,8 +89,8 @@ class IdempotencyMiddleware:
             cursor.execute(
                 """
                 INSERT INTO reliability_idempotency_key
-                    (key, tenant_id, endpoint, request_hash, response_status, response_body, expires_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (key, tenant_id, endpoint, request_hash, response_status, response_body, created_at, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)
                 ON CONFLICT DO NOTHING
                 """,
                 [key, tenant_id, endpoint, request_hash, response.status_code, response_body, expires],

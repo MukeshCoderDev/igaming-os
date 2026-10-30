@@ -28,33 +28,61 @@ from django.db import connection
 TENANT_A = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 
-@pytest.mark.django_db
+def ensure_tenant_a():
+    from django.db import transaction
+
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL ROLE noventra_admin")
+            cursor.execute(
+                """
+                INSERT INTO tenancy_tenant
+                    (tenant_uuid, legal_name, jurisdiction, contract_id, status, created_at)
+                VALUES (%s, 'PgBouncer Test Tenant', 'US-NY', 'CTR-PGBOUNCER', 'active', NOW())
+                ON CONFLICT (tenant_uuid) DO NOTHING
+                """,
+                [str(TENANT_A)],
+            )
+
+
+@pytest.mark.django_db(transaction=True)
 class TestPgbouncerCompatibility:
     """Verify pgbouncer-safe patterns work under transaction-mode."""
 
     def test_read_under_pgbouncer(self):
         """A SELECT under pgbouncer returns expected rows."""
-        with connection.cursor() as cursor:
-            cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
-            cursor.execute("SELECT COUNT(*) FROM tenancy_tenant")
-            count = cursor.fetchone()[0]
+        from django.db import transaction
+
+        ensure_tenant_a()
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL ROLE noventra_app")
+                cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
+                cursor.execute("SELECT COUNT(*) FROM tenancy_tenant")
+                count = cursor.fetchone()[0]
         assert count == 1, f"Expected 1 tenant, got {count}"
 
     def test_write_under_pgbouncer(self):
         """An INSERT under pgbouncer persists within the transaction."""
+        from django.db import transaction
+
+        ensure_tenant_a()
         new_brand_uuid = uuid.uuid4()
-        with connection.cursor() as cursor:
-            cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
-            cursor.execute(
-                "INSERT INTO tenancy_brand (brand_uuid, tenant_uuid, name, display_name) "
-                "VALUES (%s, %s, 'test-brand', 'Test Brand')",
-                [str(new_brand_uuid), str(TENANT_A)],
-            )
-            cursor.execute(
-                "SELECT name FROM tenancy_brand WHERE brand_uuid = %s",
-                [str(new_brand_uuid)],
-            )
-            row = cursor.fetchone()
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL ROLE noventra_app")
+                cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
+                cursor.execute(
+                    "INSERT INTO tenancy_brand "
+                    "(brand_uuid, tenant_uuid, name, display_name, created_at) "
+                    "VALUES (%s, %s, 'test-brand', 'Test Brand', NOW())",
+                    [str(new_brand_uuid), str(TENANT_A)],
+                )
+                cursor.execute(
+                    "SELECT name FROM tenancy_brand WHERE brand_uuid = %s",
+                    [str(new_brand_uuid)],
+                )
+                row = cursor.fetchone()
         assert row is not None
         assert row[0] == "test-brand"
 
@@ -62,13 +90,17 @@ class TestPgbouncerCompatibility:
         """A rolled-back transaction leaves no side effects."""
         new_brand_uuid = uuid.uuid4()
         from django.db import transaction
+
+        ensure_tenant_a()
         try:
             with transaction.atomic():
                 with connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL ROLE noventra_app")
                     cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
                     cursor.execute(
-                        "INSERT INTO tenancy_brand (brand_uuid, tenant_uuid, name, display_name) "
-                        "VALUES (%s, %s, 'rollback-brand', 'Rollback Brand')",
+                        "INSERT INTO tenancy_brand "
+                        "(brand_uuid, tenant_uuid, name, display_name, created_at) "
+                        "VALUES (%s, %s, 'rollback-brand', 'Rollback Brand', NOW())",
                         [str(new_brand_uuid), str(TENANT_A)],
                     )
                 raise RuntimeError("intentional rollback")
@@ -76,13 +108,15 @@ class TestPgbouncerCompatibility:
             pass
 
         # Verify the brand was NOT persisted.
-        with connection.cursor() as cursor:
-            cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
-            cursor.execute(
-                "SELECT COUNT(*) FROM tenancy_brand WHERE brand_uuid = %s",
-                [str(new_brand_uuid)],
-            )
-            count = cursor.fetchone()[0]
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL ROLE noventra_app")
+                cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
+                cursor.execute(
+                    "SELECT COUNT(*) FROM tenancy_brand WHERE brand_uuid = %s",
+                    [str(new_brand_uuid)],
+                )
+                count = cursor.fetchone()[0]
         assert count == 0, "Rolled-back brand was persisted (pgbouncer transaction issue)"
 
     def test_set_local_does_not_leak_between_transactions(self):
@@ -94,9 +128,11 @@ class TestPgbouncerCompatibility:
         """
         from django.db import transaction
 
+        ensure_tenant_a()
         # Transaction 1: set tenant to TENANT_A.
         with transaction.atomic():
             with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL ROLE noventra_app")
                 cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
                 cursor.execute("SELECT COUNT(*) FROM tenancy_tenant")
                 count_1 = cursor.fetchone()[0]
@@ -105,8 +141,7 @@ class TestPgbouncerCompatibility:
         # Transaction 2: do NOT set tenant. Should see zero rows (fail-closed).
         with transaction.atomic():
             with connection.cursor() as cursor:
-                # Explicitly clear any leaked setting.
-                cursor.execute("SET LOCAL app.tenant_uuid = ''")
+                cursor.execute("SET LOCAL ROLE noventra_app")
                 cursor.execute("SELECT COUNT(*) FROM tenancy_tenant")
                 count_2 = cursor.fetchone()[0]
         assert count_2 == 0, "SET LOCAL leaked between transactions (pgbouncer/RLS issue)"

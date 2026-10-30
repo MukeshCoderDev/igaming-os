@@ -254,18 +254,18 @@ class WebhookService:
         event_type = event.get("type", "unknown")
 
         # Step 3: Check idempotency (Phase 8 inbox pattern).
-        try:
-            WebhookLog.objects.create(
-                tenant_uuid=uuid.UUID(tenant_uuid),
-                psp_name=psp_name,
-                psp_event_id=psp_event_id,
-                event_type=event_type,
-                payload=event,
-                signature_valid=True,
-                processed=False,
-            )
-        except Exception:
-            # Duplicate event (unique constraint) → idempotent 200.
+        _, created = WebhookLog.objects.get_or_create(
+            tenant_uuid=uuid.UUID(tenant_uuid),
+            psp_name=psp_name,
+            psp_event_id=psp_event_id,
+            defaults={
+                "event_type": event_type,
+                "payload": event,
+                "signature_valid": True,
+                "processed": False,
+            },
+        )
+        if not created:
             log.info("webhook_duplicate_idempotent", extra={
                 "psp": psp_name, "event_id": psp_event_id,
             })

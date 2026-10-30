@@ -83,7 +83,7 @@ class Migration(migrations.Migration):
         ),
         # ── Function app.tenant_uuid() — fail-closed ────────────────
         # Returns the current tenant UUID from the session setting
-        # `app.tenant_id`. Fail-closed: if the setting is not set, returns
+        # `app.tenant_uuid`. Fail-closed: if the setting is not set, returns
         # NULL, which causes RLS policies using `tenant_id = app.tenant_uuid()`
         # to match no rows (deny-all).
         migrations.RunSQL(
@@ -91,7 +91,7 @@ class Migration(migrations.Migration):
                 """
                 CREATE OR REPLACE FUNCTION app.tenant_uuid() RETURNS uuid AS $$
                 BEGIN
-                    RETURN NULLIF(current_setting('app.tenant_id', true), '')::uuid;
+                    RETURN NULLIF(current_setting('app.tenant_uuid', true), '')::uuid;
                 END;
                 $$ LANGUAGE plpgsql STABLE;
                 """,

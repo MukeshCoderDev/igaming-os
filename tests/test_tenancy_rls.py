@@ -53,6 +53,7 @@ class TestCrossTenantRead:
     def test_tenant_a_cannot_read_tenant_b_data(self):
         """When app.tenant_uuid = TENANT_A, Tenant B's rows are invisible."""
         with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL ROLE noventra_app")
             cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
             cursor.execute("SELECT COUNT(*) FROM tenancy_tenant")
             count = cursor.fetchone()[0]
@@ -63,6 +64,7 @@ class TestCrossTenantRead:
     def test_tenant_b_cannot_read_tenant_a_data(self):
         """When app.tenant_uuid = TENANT_B, Tenant A's rows are invisible."""
         with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL ROLE noventra_app")
             cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_B)])
             cursor.execute("SELECT COUNT(*) FROM tenancy_tenant")
             count = cursor.fetchone()[0]
@@ -72,6 +74,7 @@ class TestCrossTenantRead:
     def test_no_tenant_set_returns_zero_rows(self):
         """When app.tenant_uuid is not set (NULL), zero rows returned (fail-closed)."""
         with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL ROLE noventra_app")
             cursor.execute("SET LOCAL app.tenant_uuid = ''")
             cursor.execute("SELECT COUNT(*) FROM tenancy_tenant")
             count = cursor.fetchone()[0]
@@ -81,6 +84,7 @@ class TestCrossTenantRead:
     def test_tenant_a_brand_visibility(self):
         """Tenant A sees only its own brands."""
         with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL ROLE noventra_app")
             cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
             cursor.execute("SELECT COUNT(*) FROM tenancy_brand")
             count = cursor.fetchone()[0]
@@ -94,11 +98,13 @@ class TestCrossTenantWrite:
     def test_tenant_a_cannot_insert_tenant_b_brand(self):
         """INSERT with tenant_uuid = TENANT_B while app.tenant_uuid = TENANT_A fails."""
         with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL ROLE noventra_app")
             cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
             with pytest.raises(Exception) as exc_info:
                 cursor.execute(
-                    "INSERT INTO tenancy_brand (brand_uuid, tenant_uuid, name, display_name) "
-                    "VALUES (%s, %s, 'stolen', 'Stolen Brand')",
+                    "INSERT INTO tenancy_brand "
+                    "(brand_uuid, tenant_uuid, name, display_name, created_at) "
+                    "VALUES (%s, %s, 'stolen', 'Stolen Brand', NOW())",
                     [str(uuid.uuid4()), str(TENANT_B)],
                 )
             # RLS WITH CHECK violation raises an error.
@@ -152,14 +158,16 @@ class TestTenantLifecycle:
         """A new tenant can be created and is visible under its own RLS context."""
         new_uuid = uuid.uuid4()
         with connection.cursor() as cursor:
-            # Create as break-glass (no RLS) — simulating provisioning.
+            cursor.execute("SET LOCAL ROLE noventra_admin")
             cursor.execute("SET LOCAL app.tenant_uuid = ''")
             cursor.execute(
-                "INSERT INTO tenancy_tenant (tenant_uuid, legal_name, contract_id, status) "
-                "VALUES (%s, 'Test Bank', 'CTR-TEST', 'active')",
+                "INSERT INTO tenancy_tenant "
+                "(tenant_uuid, legal_name, jurisdiction, contract_id, status, created_at) "
+                "VALUES (%s, 'Test Bank', 'US-NY', 'CTR-TEST', 'active', NOW())",
                 [str(new_uuid)],
             )
             # Now switch to the new tenant's context.
+            cursor.execute("SET LOCAL ROLE noventra_app")
             cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(new_uuid)])
             cursor.execute("SELECT legal_name FROM tenancy_tenant WHERE tenant_uuid = %s", [str(new_uuid)])
             row = cursor.fetchone()
@@ -170,6 +178,7 @@ class TestTenantLifecycle:
     def test_suspend_tenant(self):
         """A tenant can be suspended (status changed)."""
         with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL ROLE noventra_app")
             cursor.execute("SET LOCAL app.tenant_uuid = %s", [str(TENANT_A)])
             cursor.execute(
                 "UPDATE tenancy_tenant SET status = 'suspended', suspended_at = NOW() "
